@@ -1,0 +1,46 @@
+[project]
+name = "email-domain-scrubber"
+version = "0.1.0"
+description = "MCP server and skill for privacy risk analysis and anonymization of email domains in platform usage metric reports"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "google-api-python-client>=2.185.0",
+    "google-auth>=2.41.1",
+    "mcp[cli]>=2.0.0",
+    "pydantic>=2.12.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.15.10",
+]
+
+[project.scripts]
+email-domain-scrubber = "email_domain_scrubber.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/email_domain_scrubber"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+# Required by format.skip-magic-trailing-comma below.
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

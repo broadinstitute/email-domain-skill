@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "email-domain-scrubber": {
+      "command": "uv",
+      "args": ["run", "--frozen", "email-domain-scrubber"],
+      "env": {}
+    }
+  }
+}
