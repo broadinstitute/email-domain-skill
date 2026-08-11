@@ -24,6 +24,7 @@ import configparser
 import functools
 import json
 import os
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,24 @@ def credentials() -> Any:
     """Credentials from the rclone remote named in the environment, or from ADC."""
     remote = os.environ.get(RCLONE_REMOTE_ENV, '').strip()
     return rclone_credentials(remote) if remote else adc_credentials()
+
+
+def login_hint() -> str:
+    """The command a human runs to sign in again, for whichever credential source is configured.
+
+    Both open a browser. Which one is right depends only on where credentials are coming from,
+    so this is the single place that decides, and error messages ask it rather than guessing.
+    """
+    remote = os.environ.get(RCLONE_REMOTE_ENV, '').strip()
+    return f'rclone config reconnect {remote}:' if remote else GCLOUD_LOGIN_HINT
+
+
+def credential_source() -> str:
+    """Human-readable description of where credentials are coming from."""
+    remote = os.environ.get(RCLONE_REMOTE_ENV, '').strip()
+    if remote:
+        return f'rclone remote {remote!r} in {rclone_config_path()}'
+    return 'Google application default credentials'
 
 
 def adc_credentials() -> Any:
@@ -159,6 +178,51 @@ def _parse_expiry(value: str | None) -> datetime | None:
     except ValueError:
         return None
     return parsed.astimezone(UTC).replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+#: A syntactically valid file id that cannot exist. Asking for it proves the Sheets API accepted
+#: our token — a 404 means "authorized, no such file", where a scope problem would be a 403.
+_UNUSED_FILE_ID = '1' + 'z' * 43
+
+
+@dataclass(frozen=True)
+class AccessCheck:
+    """What `verify_access` established about the current credentials."""
+
+    source: str
+    account: str
+    drive_ok: bool
+    sheets_ok: bool
+
+
+def verify_access() -> AccessCheck:
+    """Prove the credentials actually work, and report which account they belong to.
+
+    Every failure mode here is one a human has to fix, so each raises a `ScrubberError` saying
+    what to do rather than surfacing Google's wording. The server acts as the signed-in user, so
+    the account name is the first thing to check when a workbook "cannot be found".
+    """
+    from googleapiclient.discovery import build
+
+    from .errors import WorkbookNotFound
+    from .sheets import _execute
+
+    creds = credentials()
+    drive = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    about = _execute(drive.about().get(fields='user(emailAddress)'))
+    account = about.get('user', {}).get('emailAddress', '')
+
+    sheets_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
+    try:
+        _execute(
+            sheets_service.spreadsheets().get(
+                spreadsheetId=_UNUSED_FILE_ID, fields='spreadsheetId'
+            )
+        )
+    except WorkbookNotFound:
+        pass  # Expected, and exactly what we wanted to learn: the token was accepted.
+
+    return AccessCheck(source=credential_source(), account=account, drive_ok=True, sheets_ok=True)
 
 
 @functools.cache
