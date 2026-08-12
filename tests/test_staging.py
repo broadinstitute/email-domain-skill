@@ -49,7 +49,7 @@ def test_awkward_names_are_made_safe():
 
 
 def test_path_traversal_is_defused():
-    """A Drive file name is attacker-controlled if a report was shared in; it must stay a name."""
+    """A workbook name is user-supplied; flattening it must never escape the work directory."""
     for hostile in ('../../etc/passwd', '..', '../secrets', '/etc/passwd'):
         cleaned = safe_name(hostile)
         assert '/' not in cleaned
@@ -66,58 +66,24 @@ def test_long_names_are_truncated():
     assert len(safe_name('x' * 500)) == 120
 
 
-def test_the_workbook_path_always_ends_in_xlsx(tmp_path):
-    staging = Staging(tmp_path)
-
-    assert staging.workbook_path('id1', 'Q1 Metrics.xlsx').name == 'Q1 Metrics.xlsx'
-    assert staging.workbook_path('id1', 'Q1 Metrics').name == 'Q1 Metrics.xlsx'
-    assert staging.workbook_path('id1', 'Q1.XLSX').name == 'Q1.xlsx'
-
-
-def test_workbooks_are_kept_apart_by_drive_id(tmp_path):
-    staging = Staging(tmp_path)
-
-    first = staging.workbook_path('id1', 'Metrics.xlsx')
-    second = staging.workbook_path('id2', 'Metrics.xlsx')
-
-    assert first != second
-    assert first.name == second.name
-
-
 def test_the_anonymized_path_never_overwrites(tmp_path):
     staging = Staging(tmp_path)
 
-    first = staging.anonymized_path('id1', 'Q1 Metrics.xlsx')
+    first = staging.anonymized_path('/reports/Q1 Metrics.xlsx', 'Q1 Metrics.xlsx')
     assert first.name == 'Q1 Metrics (anonymized).xlsx'
 
-    first.write_bytes(b'published already')
-    second = staging.anonymized_path('id1', 'Q1 Metrics.xlsx')
+    first.write_bytes(b'already shared')
+    second = staging.anonymized_path('/reports/Q1 Metrics.xlsx', 'Q1 Metrics.xlsx')
 
     assert second.name == 'Q1 Metrics (anonymized) 2.xlsx'
 
 
-def test_freshness_needs_both_the_file_and_a_matching_marker(tmp_path):
-    staging = Staging(tmp_path)
-    path = staging.workbook_path('id1', 'Q1.xlsx')
-
-    assert not staging.is_current(path, '2026-01-01T00:00:00Z')
-
-    staging.write(path, b'content', '2026-01-01T00:00:00Z')
-    assert staging.is_current(path, '2026-01-01T00:00:00Z')
-    assert not staging.is_current(path, '2026-06-01T00:00:00Z')
-
-
-def test_an_empty_modified_time_is_never_current(tmp_path):
-    """Freshness cannot be proven without one, so re-download rather than serve a stale file."""
-    staging = Staging(tmp_path)
-    path = staging.write(staging.workbook_path('id1', 'Q1.xlsx'), b'content', '')
-
-    assert not staging.is_current(path, '')
-
-
-def test_write_returns_the_path_and_stores_the_bytes(tmp_path):
+def test_copies_are_kept_apart_by_source_path(tmp_path):
+    """Two same-named reports from different folders must not collide in the work directory."""
     staging = Staging(tmp_path)
 
-    path = staging.write(staging.workbook_path('id1', 'Q1.xlsx'), b'abc', '2026-01-01T00:00:00Z')
+    first = staging.anonymized_path('/a/Metrics.xlsx', 'Metrics.xlsx')
+    second = staging.anonymized_path('/b/Metrics.xlsx', 'Metrics.xlsx')
 
-    assert path.read_bytes() == b'abc'
+    assert first != second
+    assert first.name == second.name

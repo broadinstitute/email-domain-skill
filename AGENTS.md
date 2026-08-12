@@ -4,32 +4,24 @@ Skill and MCP server for use on platform usage metric reports that contain email
 
 Reports are local Microsoft Excel (`.xlsx`) files. Google Sheets and CSV are out of scope.
 
-**Local is the default and the only working source.** Drive support (`drive.py`, `auth.py`, and
-everything about the connector below) is intact but broken — the rclone remote's scopes do not
-satisfy the connector — and is deliberately left to be finished later. `local.py` decides which of
-the two a reference names; treat the Drive sections here as describing unfinished work.
+**Everything is local.** The server reads a workbook from disk and writes its output under the
+work directory. It has no notion of where a report came from: fetch it however you like — a
+browser, a sync client, a storage plugin — and pass the path to the file on disk. `local.py`
+resolves that reference and refuses anything that is a URL rather than a path.
 
 ## Architecture
 
-Four parts, each with one job:
+Three parts, each with one job:
 
 - **The analysis skill** judges risk and gets user approval.
 - **The `email-domain-scrubber` MCP server** (this repo) does everything deterministic and
-  auditable: fetching workbooks, finding domains, recording them, minting aliases, planning the
+  auditable: reading workbooks, finding domains, recording them, minting aliases, planning the
   rewrite, and verifying it happened.
 - **The Excel MCP server** ([`excel-mcp-server`](https://github.com/haris-musa/excel-mcp-server))
   applies the planned cell writes to a copy of the workbook.
-- **Google's Drive MCP connector** (`https://drivemcp.googleapis.com/mcp/v1`) is the only route
-  to Drive. This repo contains no Google API client code.
 
-The scrubber server is itself an MCP *client* of the Drive connector, so workbook bytes never
-pass through the model's context.
-
-The connector is read-mostly: `search_files`, `get_file_metadata`, `get_file_permissions`,
-`list_recent_files`, `read_file_content`, `download_file_content`, `create_file`, `copy_file`.
-There is **no update, delete, or move**. Two consequences shape everything else — the analysis
-workbook is kept locally rather than in Drive, and a redacted report is always published as a new
-file.
+Workbook bytes never pass through the model's context: the server reads the file itself, and only
+domains, locators, and counts travel back through a tool result.
 
 Skill to perform risk analysis of each email domain:
 
@@ -44,18 +36,18 @@ MCP server to anonymize domains and create a structured analysis and anonymizati
 - scan reports for email domain names (the analysis skill uses this to list domains to analyze)
 - store analysis results in a separate domain analysis workbook (the analysis skill calls this to report its results)
 - plan the cell writes that anonymize email domain names in the metrics reports
-- verify those writes landed, publish the result, and keep separate records of anonymizations
+- verify those writes landed and keep separate records of anonymizations
 
 ## Domain Analysis Workbook Schema
 
-This workbook is the memory of the scrubber skill and MCP server. It is a local `.xlsx` file, not
-a Drive file, because the Drive connector cannot update an existing file.
+This workbook is the memory of the scrubber skill and MCP server. It is a local `.xlsx` file, so
+it can live in a git repo alongside the reports it describes.
 
 ### *Workbooks* Sheet
 
 Columns:
 
-- `URL` workbook scanned for email domains
+- `Path` workbook scanned for email domains
 - `Title` - workbook title
 
 There can be multiple workbook rows in this sheet
@@ -66,8 +58,8 @@ Columns:
 
 - `DateExtracted`, the date the input workbook was scanned and the domain extracted from it
 - `Reference`, a locator for the cell containing the domain, of the form
-  `https://drive.google.com/file/d/<id>/view#<Sheet>!<A1>`. Drive cannot deep-link a cell of an
-  `.xlsx`, so the URL opens the file and the fragment names the cell.
+  `file:///path/to/report.xlsx#<Sheet>!<A1>`. A `file://` URL cannot deep-link a cell of an
+  `.xlsx`, so the URL names the file and the fragment names the cell.
 - `Domain`, the non-anonymized domain name found within the referenced cell
 
 There can be multiple `Reference`s for each unique `Domain`
@@ -98,16 +90,16 @@ broadinstitute.org,Low,Broad Institute,
 
 Columns:
 
-- `DateRedacted`, the date the anonymized copy was published
-- `SourceURL`, the metrics workbook that was redacted
-- `RedactedURL`, the anonymized copy published to Drive
+- `DateRedacted`, the date the anonymized copy was written
+- `SourcePath`, the metrics workbook that was redacted
+- `RedactedPath`, the anonymized copy in the work directory
 - `Reference`, a locator for the rewritten cell *in the copy*
 - `Domain`, the domain that was replaced
 - `AnonymizedDomain`, what replaced it
 
 One row per cell actually rewritten. This is what satisfies "keep separate records of
 anonymizations": `DomainAnalysis` holds the mapping and `DomainReferences` holds the source
-locations, but neither records what was published, where, and when.
+locations, but neither records what was produced, where, and when.
 
 ## Skill: Privacy Risk Analysis of Email Domains
 

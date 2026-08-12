@@ -3,9 +3,7 @@
     "email-domain-scrubber": {
       "command": "uv",
       "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "--frozen", "email-domain-scrubber"],
-      "env": {
-        "EMAIL_DOMAIN_RCLONE_REMOTE": "${EMAIL_DOMAIN_RCLONE_REMOTE:-aso}"
-      }
+      "env": {}
     },
     "excel": {
       "command": "uvx",

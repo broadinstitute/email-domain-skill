@@ -1,6 +1,5 @@
 """Planning a redaction, grouping it into write blocks, and verifying it landed."""
 
-import asyncio
 import random
 
 import pytest
@@ -15,8 +14,10 @@ from email_domain_scrubber.redact import (
     record,
     verify,
 )
-from email_domain_scrubber.scan import scan_path, stage_workbook
+from email_domain_scrubber.scan import open_workbook, scan_path
 from email_domain_scrubber.workbook import REDACTIONS
+
+from .fakes import write_xlsx
 
 USERS = {
     'Users': [
@@ -29,18 +30,18 @@ USERS = {
 
 
 @pytest.fixture
-def metrics(drive, tmp_path):
-    return drive.add_workbook('Q1 Metrics.xlsx', USERS, tmp_path, parent='folder1')
+def metrics(tmp_path):
+    return write_xlsx(tmp_path / 'Q1 Metrics.xlsx', USERS)
 
 
 @pytest.fixture
-def staged(drive, staging, metrics):
-    return asyncio.run(stage_workbook(drive, staging, metrics.file_id))
+def staged(metrics):
+    return open_workbook(str(metrics))
 
 
 @pytest.fixture
-def hits(staged, metrics):
-    return scan_path(staged.path, metrics.file_id)
+def hits(staged):
+    return scan_path(staged.path, staged.url)
 
 
 def analyze_all(analysis):
@@ -74,7 +75,7 @@ def test_plan_targets_only_domains_with_an_alias(analysis, staged, hits):
     assert plan.cells_to_change == 2
 
 
-def test_planning_touches_no_files(analysis, staged, hits, staging, drive):
+def test_planning_touches_no_files(analysis, staged, hits, staging):
     analyze_all(analysis)
     before = sorted(path.name for path in staging.root.rglob('*'))
     source = staged.path.read_bytes()
@@ -83,13 +84,12 @@ def test_planning_touches_no_files(analysis, staged, hits, staging, drive):
 
     assert sorted(path.name for path in staging.root.rglob('*')) == before
     assert staged.path.read_bytes() == source
-    assert drive.created == []
 
 
-def test_a_cell_holding_two_domains_is_edited_once(analysis, drive, staging, tmp_path):
-    file = drive.add_workbook('M.xlsx', {'S': [['a@one.org and b@two.org']]}, tmp_path)
-    staged = asyncio.run(stage_workbook(drive, staging, file.file_id))
-    hits = scan_path(staged.path, file.file_id)
+def test_a_cell_holding_two_domains_is_edited_once(analysis, tmp_path):
+    path = write_xlsx(tmp_path / 'M.xlsx', {'S': [['a@one.org and b@two.org']]})
+    staged = open_workbook(str(path))
+    hits = scan_path(staged.path, staged.url)
     analysis.store_analysis(
         [('one.org', 'High', 'person one', None), ('two.org', 'High', 'person two', None)],
         random.Random(2),
@@ -167,14 +167,14 @@ def test_columns_past_z_use_the_right_letters():
     assert coalesce([edit('S', 1, 27, 'a')])[0].start_cell == 'AA1'
 
 
-def test_a_scan_shaped_plan_makes_one_block_per_run(analysis, drive, staging, tmp_path):
+def test_a_scan_shaped_plan_makes_one_block_per_run(analysis, tmp_path):
     """The common case: a contiguous column of addresses collapses to a single write call."""
     rows = [['Email'], *[[f'user{index}@lab.io'] for index in range(20)]]
-    file = drive.add_workbook('Big.xlsx', {'Users': rows}, tmp_path)
-    staged = asyncio.run(stage_workbook(drive, staging, file.file_id))
+    path = write_xlsx(tmp_path / 'Big.xlsx', {'Users': rows})
+    staged = open_workbook(str(path))
     analysis.store_analysis([('lab.io', 'High', 'a lab', None)], random.Random(1))
 
-    plan = plan_redaction(staged, scan_path(staged.path, file.file_id), analysis)
+    plan = plan_redaction(staged, scan_path(staged.path, staged.url), analysis)
 
     assert plan.cells_to_change == 20
     assert len(plan.blocks) == 1
@@ -239,14 +239,14 @@ def test_verify_catches_an_unapplied_plan(analysis, staged, hits, staging):
     assert verify(copy, plan.mapped_domains) == ['smithlab.io']
 
 
-def test_verify_catches_a_partially_applied_plan(analysis, drive, staging, tmp_path, excel):
-    file = drive.add_workbook('Two.xlsx', {'S': [['a@one.org'], [''], ['b@two.org']]}, tmp_path)
-    staged = asyncio.run(stage_workbook(drive, staging, file.file_id))
+def test_verify_catches_a_partially_applied_plan(analysis, staging, tmp_path, excel):
+    path = write_xlsx(tmp_path / 'Two.xlsx', {'S': [['a@one.org'], [''], ['b@two.org']]})
+    staged = open_workbook(str(path))
     analysis.store_analysis(
         [('one.org', 'High', 'person one', None), ('two.org', 'High', 'person two', None)],
         random.Random(4),
     )
-    plan = plan_redaction(staged, scan_path(staged.path, file.file_id), analysis)
+    plan = plan_redaction(staged, scan_path(staged.path, staged.url), analysis)
     copy = create_copy(staged, staging)
 
     assert len(plan.blocks) == 2
@@ -266,42 +266,44 @@ def test_a_domain_left_as_is_stays_in_the_copy(analysis, staged, hits, staging, 
 
 
 # -- the audit record --------------------------------------------------------------------------
-def test_record_writes_one_row_per_cell_and_domain(analysis, staged, hits):
+def test_record_writes_one_row_per_cell_and_domain(analysis, staged, hits, tmp_path):
     analyze_all(analysis)
     plan = plan_redaction(staged, hits, analysis)
-    url = 'https://drive.google.com/file/d/copy123/view'
+    copy = write_xlsx(tmp_path / 'Q1 Metrics (anonymized).xlsx', USERS)
 
-    records = record(plan, url, analysis)
+    records = record(plan, copy, analysis)
 
     assert len(records) == 2
     rows = xlsx.read_rows(analysis.path, REDACTIONS)[1:]
     assert len(rows) == 2
-    assert {row[2] for row in rows} == {url}
+    assert {row[1] for row in rows} == {str(staged.path)}
+    assert {row[2] for row in rows} == {str(copy)}
     assert {row[4] for row in rows} == {'smithlab.io'}
     assert {row[5] for row in rows} == {plan.mapped_domains['smithlab.io']}
 
 
-def test_recorded_references_point_at_the_published_copy(analysis, staged, hits):
+def test_recorded_references_point_at_the_redacted_copy(analysis, staged, hits, tmp_path):
     analyze_all(analysis)
     plan = plan_redaction(staged, hits, analysis)
+    copy = write_xlsx(tmp_path / 'Q1 Metrics (anonymized).xlsx', USERS)
 
-    records = record(plan, 'https://drive.google.com/file/d/copy123/view', analysis)
+    records = record(plan, copy, analysis)
 
     assert [rec.reference for rec in records] == [
-        'https://drive.google.com/file/d/copy123/view#Users!B2',
-        'https://drive.google.com/file/d/copy123/view#Users!B4',
+        f'{copy.as_uri()}#Users!B2',
+        f'{copy.as_uri()}#Users!B4',
     ]
 
 
-def test_a_two_domain_cell_records_both_replacements(analysis, drive, staging, tmp_path):
-    file = drive.add_workbook('M.xlsx', {'S': [['a@one.org and b@two.org']]}, tmp_path)
-    staged = asyncio.run(stage_workbook(drive, staging, file.file_id))
+def test_a_two_domain_cell_records_both_replacements(analysis, tmp_path):
+    path = write_xlsx(tmp_path / 'M.xlsx', {'S': [['a@one.org and b@two.org']]})
+    staged = open_workbook(str(path))
     analysis.store_analysis(
         [('one.org', 'High', 'person one', None), ('two.org', 'High', 'person two', None)],
         random.Random(2),
     )
-    plan = plan_redaction(staged, scan_path(staged.path, file.file_id), analysis)
+    plan = plan_redaction(staged, scan_path(staged.path, staged.url), analysis)
 
-    records = record(plan, 'https://drive.google.com/file/d/copy123/view', analysis)
+    records = record(plan, tmp_path / 'copy.xlsx', analysis)
 
     assert {rec.domain for rec in records} == {'one.org', 'two.org'}
