@@ -51,7 +51,7 @@ def test_missing_scope_403_explains_how_to_re_login():
             403, 'Request had insufficient authentication scopes.', 'insufficientPermissions'
         )
     )
-    with pytest.raises(MissingScopes, match='gcloud auth application-default login --scopes='):
+    with pytest.raises(MissingScopes, match='rclone config'):
         sheets._execute(request)
 
 

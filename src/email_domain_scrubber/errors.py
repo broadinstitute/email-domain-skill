@@ -4,15 +4,6 @@
 name the offending value and say what to do about it.
 """
 
-#: The login users need for the server to reach Sheets and Drive. User ADC credentials carry the
-#: scopes granted at login time, so `--scopes` is not optional.
-GCLOUD_LOGIN_HINT = (
-    'gcloud auth application-default login --scopes='
-    'https://www.googleapis.com/auth/spreadsheets,'
-    'https://www.googleapis.com/auth/drive,'
-    'https://www.googleapis.com/auth/cloud-platform'
-)
-
 
 class ScrubberError(Exception):
     """Base class for errors that are the caller's problem, not a bug."""
@@ -24,9 +15,9 @@ class MissingScopes(ScrubberError):
     def __init__(self, detail: str = '') -> None:
         super().__init__(
             'Google rejected the request for lack of scope'
-            f'{f" ({detail})" if detail else ""}. Application default credentials only carry the '
-            'scopes granted at login, so re-run:\n'
-            f'  {GCLOUD_LOGIN_HINT}'
+            f'{f" ({detail})" if detail else ""}. Credentials only carry the scopes granted at '
+            'login, so re-run `rclone config` for the remote named by '
+            'EMAIL_DOMAIN_RCLONE_REMOTE and authorize it with the full "drive" scope.'
         )
 
 
