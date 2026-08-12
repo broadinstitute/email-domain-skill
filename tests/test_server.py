@@ -1,74 +1,48 @@
 """The MCP tool surface, driven the way the analysis skill drives it."""
 
+import asyncio
+
 import pytest
 
-from email_domain_scrubber import server
-from email_domain_scrubber.errors import InvalidWorkbookReference, UnanalyzedDomains
-from email_domain_scrubber.workbook import DOMAIN_ANALYSIS, REDACTIONS, WORKBOOKS
+from email_domain_scrubber import server, xlsx
+from email_domain_scrubber.errors import RedactionNotApplied, UnanalyzedDomains, UnsupportedWorkbook
+from email_domain_scrubber.staging import ANALYSIS_WORKBOOK_ENV
+from email_domain_scrubber.workbook import REDACTIONS, WORKBOOKS
+
+USERS = {
+    'Users': [
+        ['User', 'Email'],
+        ['Alice', 'alice@smithlab.io'],
+        ['Bob', 'bob@broadinstitute.org'],
+        ['Carol', 'carol@smithlab.io'],
+    ]
+}
 
 
 @pytest.fixture(autouse=True)
-def _use_fake_backend(backend, monkeypatch):
-    monkeypatch.delenv(server.ANALYSIS_WORKBOOK_ENV, raising=False)
-    server.set_backend(backend)
+def _use_fakes(drive, staging):
+    server.set_backend(drive, staging)
     yield
-    server.set_backend(None)
+    server.set_backend(None, None)
 
 
 @pytest.fixture
-def metrics(backend):
-    return backend.add_spreadsheet(
-        'Q1 Metrics',
-        {
-            'Users': [
-                ['User', 'Email'],
-                ['Alice', 'alice@smithlab.io'],
-                ['Bob', 'bob@broadinstitute.org'],
-                ['Carol', 'carol@smithlab.io'],
-            ]
-        },
-        parent='folder1',
-    )
+def metrics(drive, tmp_path):
+    return drive.add_workbook('Q1 Metrics.xlsx', USERS, tmp_path, parent='folder1')
 
 
-def _analysis_url():
-    return server.create_analysis_workbook('Email Domain Analysis').analysis_workbook_url
+@pytest.fixture
+def book(tmp_path):
+    """An explicit analysis workbook path, as the skill would pass."""
+    return str(tmp_path / 'analysis.xlsx')
 
 
-def test_create_analysis_workbook():
-    created = server.create_analysis_workbook()
-    assert created.sheets == [WORKBOOKS, 'DomainReferences', DOMAIN_ANALYSIS, REDACTIONS]
-    assert created.analysis_workbook_url.startswith('https://docs.google.com/spreadsheets/d/')
+def run(coroutine):
+    return asyncio.run(coroutine)
 
 
-def test_tools_require_an_analysis_workbook(metrics):
-    with pytest.raises(InvalidWorkbookReference, match=server.ANALYSIS_WORKBOOK_ENV):
-        server.scan_workbook(metrics.file_id)
-
-
-def test_analysis_workbook_defaults_to_the_environment(monkeypatch, metrics):
-    monkeypatch.setenv(server.ANALYSIS_WORKBOOK_ENV, _analysis_url())
-    result = server.scan_workbook(metrics.file_id)
-    assert result.domains_found == 2
-
-
-def test_scan_then_list_then_store_then_redact(backend, metrics):
-    analysis_url = _analysis_url()
-
-    scan = server.scan_workbook(metrics.file_id, analysis_url)
-    assert scan.domains_found == 2
-    assert scan.references_recorded == 3
-    assert set(scan.new_domains) == {'smithlab.io', 'broadinstitute.org'}
-    assert set(scan.pending_analysis) == {'smithlab.io', 'broadinstitute.org'}
-    assert not scan.converted_from_upload
-
-    pending = server.list_domains_for_analysis(analysis_url)
-    by_domain = {item.domain: item for item in pending}
-    assert by_domain['smithlab.io'].reference_count == 2
-    assert len(by_domain['smithlab.io'].example_references) == 2
-    assert by_domain['broadinstitute.org'].reference_count == 1
-
-    stored = server.store_domain_analysis(
+def analyze_all(book):
+    return server.store_domain_analysis(
         [
             server.AnalysisInput(
                 domain='smithlab.io', risk='High', explanation='Personal lab domain'
@@ -77,128 +51,263 @@ def test_scan_then_list_then_store_then_redact(backend, metrics):
                 domain='broadinstitute.org', risk='Low', explanation='Broad Institute'
             ),
         ],
-        analysis_url,
+        book,
     )
+
+
+# -- registration ------------------------------------------------------------------------------
+def test_all_tools_are_registered():
+    """Guards against a tool being added without its @mcp.tool() decorator."""
+    tools = run(server.mcp.list_tools())
+    assert {tool.name for tool in tools} == {
+        'scan_workbook',
+        'list_domains_for_analysis',
+        'store_domain_analysis',
+        'plan_redaction',
+        'finish_redaction',
+    }
+
+
+# -- the analysis workbook ---------------------------------------------------------------------
+def test_the_analysis_workbook_is_created_on_first_use(metrics, book):
+    from pathlib import Path
+
+    assert not Path(book).exists()
+    result = run(server.scan_workbook(metrics.file_id, book))
+
+    assert Path(book).is_file()
+    assert result.analysis_workbook_path == book
+
+
+def test_the_analysis_workbook_defaults_to_the_environment(monkeypatch, metrics, book):
+    monkeypatch.setenv(ANALYSIS_WORKBOOK_ENV, book)
+
+    result = run(server.scan_workbook(metrics.file_id))
+
+    assert result.analysis_workbook_path == book
+    assert result.domains_found == 2
+
+
+def test_the_analysis_workbook_falls_back_to_the_work_directory(metrics, staging):
+    result = run(server.scan_workbook(metrics.file_id))
+    assert result.analysis_workbook_path.endswith('analysis.xlsx')
+
+
+# -- the happy path ----------------------------------------------------------------------------
+def test_scan_list_store_plan_write_finish(drive, metrics, book, excel):
+    scan = run(server.scan_workbook(metrics.file_id, book))
+    assert scan.domains_found == 2
+    assert scan.references_recorded == 3
+    assert set(scan.new_domains) == {'smithlab.io', 'broadinstitute.org'}
+    assert set(scan.pending_analysis) == {'smithlab.io', 'broadinstitute.org'}
+    assert scan.downloaded
+
+    pending = server.list_domains_for_analysis(book)
+    by_domain = {item.domain: item for item in pending}
+    assert by_domain['smithlab.io'].reference_count == 2
+    assert len(by_domain['smithlab.io'].example_references) == 2
+    assert by_domain['broadinstitute.org'].reference_count == 1
+
+    stored = analyze_all(book)
     assert stored.still_pending == []
-    actions = {item.domain: item.action for item in stored.stored}
-    assert actions == {'smithlab.io': 'will_be_anonymized', 'broadinstitute.org': 'left_as_is'}
+    assert {item.domain: item.action for item in stored.stored} == {
+        'smithlab.io': 'will_be_anonymized',
+        'broadinstitute.org': 'left_as_is',
+    }
     alias = next(item.anonymized_domain for item in stored.stored if item.domain == 'smithlab.io')
 
-    dry = server.redact_workbook(metrics.file_id, analysis_url, dry_run=True)
-    assert dry.dry_run
-    assert dry.cells_changed == 2
-    assert dry.redacted_workbook_url == ''
-    assert dry.domains_anonymized == {'smithlab.io': alias}
-    assert dry.domains_left_as_is == ['broadinstitute.org']
-    assert dry.sample_changes[0].after == f'alice@{alias}'
+    plan = run(server.plan_redaction(metrics.file_id, book))
+    assert plan.cells_to_change == 2
+    assert plan.domains_anonymized == {'smithlab.io': alias}
+    assert plan.domains_left_as_is == ['broadinstitute.org']
+    assert plan.sample_changes[0].after == f'alice@{alias}'
+    # B3 is kept as-is, so B2 and B4 cannot share a block without rewriting it.
+    assert [(block.sheet_name, block.start_cell, block.data) for block in plan.write_blocks] == [
+        ('Users', 'B2', [[f'alice@{alias}']]),
+        ('Users', 'B4', [[f'carol@{alias}']]),
+    ]
 
-    real = server.redact_workbook(metrics.file_id, analysis_url)
-    assert not real.dry_run
-    assert real.redacted_workbook_title == 'Q1 Metrics (anonymized)'
-    assert real.cells_changed == 2
-    assert real.remaining_domains == ['broadinstitute.org']
+    excel.apply(plan.redacted_path, _blocks(plan))
 
-    copy_id = real.redacted_workbook_url.split('/d/')[1].split('/')[0]
-    assert backend.sheet_values(copy_id, 'Users')[1] == ['Alice', f'alice@{alias}']
-    assert backend.sheet_values(metrics.file_id, 'Users')[1] == ['Alice', 'alice@smithlab.io']
+    finished = run(server.finish_redaction(metrics.file_id, plan.redacted_path, book))
+    assert finished.cells_changed == 2
+    assert finished.remaining_domains == ['broadinstitute.org']
+    assert finished.redactions_recorded == 2
+    assert finished.redacted_workbook_title == 'Q1 Metrics (anonymized).xlsx'
+
+    published = drive.created[-1]
+    assert published.mime_type.endswith('spreadsheetml.sheet')
+    assert finished.redacted_workbook_url.endswith(f'/d/{published.file_id}/view')
 
 
-def test_dry_run_creates_no_files(backend, metrics):
-    analysis_url = _analysis_url()
-    server.scan_workbook(metrics.file_id, analysis_url)
+def _blocks(plan):
+    """The plan's write blocks in the shape the Recorder (and Excel MCP server) applies."""
+    from email_domain_scrubber.redact import WriteBlock
+
+    return [
+        WriteBlock(sheet=block.sheet_name, start_cell=block.start_cell, values=block.data)
+        for block in plan.write_blocks
+    ]
+
+
+def test_a_contiguous_column_needs_one_write_call(drive, book, tmp_path, excel):
+    rows = [['Email'], *[[f'user{index}@lab.io'] for index in range(30)]]
+    file = drive.add_workbook('Big.xlsx', {'Users': rows}, tmp_path)
+    run(server.scan_workbook(file.file_id, book))
+    server.store_domain_analysis(
+        [server.AnalysisInput(domain='lab.io', risk='High', explanation='a lab')], book
+    )
+
+    plan = run(server.plan_redaction(file.file_id, book))
+
+    assert plan.cells_to_change == 30
+    assert len(plan.write_blocks) == 1
+
+
+def test_scattered_edits_cost_one_write_call_each(drive, book, tmp_path):
+    """The bound on write calls: one per redacted cell when kept cells break up the runs."""
+    rows = [
+        ['Email'],
+        *[[f'u{i}@{"lab.io" if i % 2 else "broadinstitute.org"}'] for i in range(10)],
+    ]
+    file = drive.add_workbook('Mixed.xlsx', {'Users': rows}, tmp_path)
+    run(server.scan_workbook(file.file_id, book))
     server.store_domain_analysis(
         [
-            server.AnalysisInput(domain='smithlab.io', risk='High', explanation='lab'),
+            server.AnalysisInput(domain='lab.io', risk='High', explanation='a lab'),
             server.AnalysisInput(domain='broadinstitute.org', risk='Low', explanation='Broad'),
         ],
-        analysis_url,
+        book,
     )
-    before = set(backend.files)
-    server.redact_workbook(metrics.file_id, analysis_url, dry_run=True)
-    assert set(backend.files) == before
+
+    plan = run(server.plan_redaction(file.file_id, book))
+
+    assert plan.cells_to_change == 5
+    assert len(plan.write_blocks) == 5
 
 
-def test_redact_refuses_before_analysis_is_complete(metrics):
-    analysis_url = _analysis_url()
-    server.scan_workbook(metrics.file_id, analysis_url)
+# -- the source is never touched ---------------------------------------------------------------
+def test_the_drive_original_is_never_modified(drive, metrics, book, excel):
+    before = drive.files[metrics.file_id].content
+    scan = run(server.scan_workbook(metrics.file_id, book))
+    analyze_all(book)
+    plan = run(server.plan_redaction(metrics.file_id, book))
+    excel.apply(plan.redacted_path, _blocks(plan))
+    run(server.finish_redaction(metrics.file_id, plan.redacted_path, book))
+
+    assert drive.files[metrics.file_id].content == before
+    # Nor is the staged local copy of it, which the next scan will reuse.
+    assert xlsx.read_rows(scan.local_path, 'Users')[1] == ['Alice', 'alice@smithlab.io']
+
+
+def test_planning_publishes_nothing(drive, metrics, book):
+    run(server.scan_workbook(metrics.file_id, book))
+    analyze_all(book)
+
+    run(server.plan_redaction(metrics.file_id, book))
+
+    assert drive.created == []
+
+
+# -- refusals ----------------------------------------------------------------------------------
+def test_plan_refuses_before_analysis_is_complete(metrics, book):
+    run(server.scan_workbook(metrics.file_id, book))
     server.store_domain_analysis(
-        [server.AnalysisInput(domain='smithlab.io', risk='High', explanation='lab')], analysis_url
+        [server.AnalysisInput(domain='smithlab.io', risk='High', explanation='lab')], book
     )
+
     with pytest.raises(UnanalyzedDomains, match='broadinstitute.org'):
-        server.redact_workbook(metrics.file_id, analysis_url, dry_run=True)
+        run(server.plan_redaction(metrics.file_id, book))
 
 
-def test_rescanning_preserves_analysis_and_adds_only_new_domains(backend, metrics):
-    analysis_url = _analysis_url()
-    server.scan_workbook(metrics.file_id, analysis_url)
+def test_finish_refuses_when_the_blocks_were_never_applied(drive, metrics, book):
+    run(server.scan_workbook(metrics.file_id, book))
+    analyze_all(book)
+    plan = run(server.plan_redaction(metrics.file_id, book))
+
+    with pytest.raises(RedactionNotApplied, match='smithlab.io'):
+        run(server.finish_redaction(metrics.file_id, plan.redacted_path, book))
+    assert drive.created == []
+
+
+def test_finish_refuses_a_path_that_does_not_exist(metrics, book, tmp_path):
+    run(server.scan_workbook(metrics.file_id, book))
+    analyze_all(book)
+
+    with pytest.raises(FileNotFoundError):
+        run(server.finish_redaction(metrics.file_id, str(tmp_path / 'nope.xlsx'), book))
+
+
+def test_a_google_sheet_is_refused(drive, book):
+    sheet = drive.add_bytes('Q1', b'', mime_type='application/vnd.google-apps.spreadsheet')
+
+    with pytest.raises(UnsupportedWorkbook, match='.xlsx'):
+        run(server.scan_workbook(sheet.file_id, book))
+
+
+# -- re-scanning -------------------------------------------------------------------------------
+def test_rescanning_preserves_analysis_and_adds_only_new_domains(drive, metrics, book, tmp_path):
+    run(server.scan_workbook(metrics.file_id, book))
     server.store_domain_analysis(
-        [server.AnalysisInput(domain='smithlab.io', risk='High', explanation='lab')], analysis_url
+        [server.AnalysisInput(domain='smithlab.io', risk='High', explanation='lab')], book
     )
-    alias = server.list_domains_for_analysis(analysis_url, include_analyzed=True)
-    before = {item.domain: item.anonymized_domain for item in alias}
+    before = {
+        item.domain: item.anonymized_domain
+        for item in server.list_domains_for_analysis(book, include_analyzed=True)
+    }
 
-    sheet = backend.files[metrics.file_id].sheets[0]
-    sheet.set(4, 1, 'dave@newlab.io')
-    again = server.scan_workbook(metrics.file_id, analysis_url)
+    grown = dict(USERS)
+    grown['Users'] = [*USERS['Users'], ['Dave', 'dave@newlab.io']]
+    replacement = drive.add_workbook('grown.xlsx', grown, tmp_path)
+    drive.touch(metrics.file_id, replacement.content, '2026-07-01T00:00:00Z')
+
+    again = run(server.scan_workbook(metrics.file_id, book))
 
     assert again.new_domains == ['newlab.io']
     assert again.references_recorded == 1
-    assert again.pending_analysis == ['broadinstitute.org', 'newlab.io']
+    assert sorted(again.pending_analysis) == ['broadinstitute.org', 'newlab.io']
 
     after = {
         item.domain: item.anonymized_domain
-        for item in server.list_domains_for_analysis(analysis_url, include_analyzed=True)
+        for item in server.list_domains_for_analysis(book, include_analyzed=True)
     }
     assert after['smithlab.io'] == before['smithlab.io']
 
 
-def test_rescanning_records_the_workbook_once(backend, metrics):
-    analysis_url = _analysis_url()
-    server.scan_workbook(metrics.file_id, analysis_url)
-    server.scan_workbook(metrics.file_id, analysis_url)
+def test_rescanning_reuses_the_local_copy(drive, metrics, book):
+    run(server.scan_workbook(metrics.file_id, book))
+    again = run(server.scan_workbook(metrics.file_id, book))
 
-    analysis_id = analysis_url.split('/d/')[1].split('/')[0]
-    rows = backend.sheet_values(analysis_id, WORKBOOKS)[1:]
+    assert not again.downloaded
+    assert drive.downloads == [metrics.file_id]
+
+
+def test_rescanning_records_the_workbook_once(metrics, book):
+    run(server.scan_workbook(metrics.file_id, book))
+    run(server.scan_workbook(metrics.file_id, book))
+
+    rows = xlsx.read_rows(book, WORKBOOKS)[1:]
     assert len(rows) == 1
-    assert rows[0][1] == 'Q1 Metrics'
+    assert rows[0][1] == 'Q1 Metrics.xlsx'
 
 
-def test_scan_converts_a_drive_xlsx_upload(backend):
-    analysis_url = _analysis_url()
-    upload = backend.add_upload(
-        'Q2 Metrics.xlsx',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        parent='folder1',
-    )
-    # The converted copy is what gets scanned, so put the data there.
-    scan_first = server.scan_workbook(upload.file_id, analysis_url)
-    assert scan_first.converted_from_upload
-    assert scan_first.scanned_workbook_title == 'Q2 Metrics (Sheets)'
-
-    converted_id = scan_first.scanned_workbook_url.split('/d/')[1].split('/')[0]
-    backend.files[converted_id].sheets[0].set(0, 0, 'pi@tinylab.org')
-    scan_second = server.scan_workbook(upload.file_id, analysis_url)
-
-    assert scan_second.scanned_workbook_url == scan_first.scanned_workbook_url
-    assert scan_second.new_domains == ['tinylab.org']
-
-
-def test_list_domains_can_include_analyzed(metrics):
-    analysis_url = _analysis_url()
-    server.scan_workbook(metrics.file_id, analysis_url)
+# -- listing and storing -----------------------------------------------------------------------
+def test_list_domains_can_include_analyzed(metrics, book):
+    run(server.scan_workbook(metrics.file_id, book))
     server.store_domain_analysis(
-        [server.AnalysisInput(domain='smithlab.io', risk='High', explanation='lab')], analysis_url
+        [server.AnalysisInput(domain='smithlab.io', risk='High', explanation='lab')], book
     )
-    assert [item.domain for item in server.list_domains_for_analysis(analysis_url)] == [
+
+    assert [item.domain for item in server.list_domains_for_analysis(book)] == [
         'broadinstitute.org'
     ]
-    everything = server.list_domains_for_analysis(analysis_url, include_analyzed=True)
+    everything = server.list_domains_for_analysis(book, include_analyzed=True)
     assert {item.domain for item in everything} == {'smithlab.io', 'broadinstitute.org'}
 
 
-def test_store_respects_an_explicit_anonymize_override(metrics):
-    analysis_url = _analysis_url()
-    server.scan_workbook(metrics.file_id, analysis_url)
+def test_store_respects_an_explicit_anonymize_override(metrics, book):
+    run(server.scan_workbook(metrics.file_id, book))
+
     stored = server.store_domain_analysis(
         [
             server.AnalysisInput(
@@ -208,21 +317,48 @@ def test_store_respects_an_explicit_anonymize_override(metrics):
                 anonymize=True,
             )
         ],
-        analysis_url,
+        book,
     )
+
     assert stored.stored[0].action == 'will_be_anonymized'
     assert stored.stored[0].anonymized_domain.startswith('anon')
 
 
-def test_all_tools_are_registered():
-    """Guards against a tool being added without its @mcp.tool() decorator."""
-    import asyncio
+def test_aliases_are_stable_across_quarters(drive, book, tmp_path, excel):
+    q1 = drive.add_workbook('Q1.xlsx', {'S': [['a@lab.io']]}, tmp_path)
+    run(server.scan_workbook(q1.file_id, book))
+    first = server.store_domain_analysis(
+        [server.AnalysisInput(domain='lab.io', risk='High', explanation='a lab')], book
+    )
 
-    tools = asyncio.run(server.mcp.list_tools())
-    assert {tool.name for tool in tools} == {
-        'create_analysis_workbook',
-        'scan_workbook',
-        'list_domains_for_analysis',
-        'store_domain_analysis',
-        'redact_workbook',
-    }
+    q2 = drive.add_workbook('Q2.xlsx', {'S': [['b@lab.io']]}, tmp_path)
+    run(server.scan_workbook(q2.file_id, book))
+    plan = run(server.plan_redaction(q2.file_id, book))
+
+    assert plan.domains_anonymized == {'lab.io': first.stored[0].anonymized_domain}
+
+
+# -- the audit trail ---------------------------------------------------------------------------
+def test_finish_records_the_published_url(drive, metrics, book, excel):
+    run(server.scan_workbook(metrics.file_id, book))
+    analyze_all(book)
+    plan = run(server.plan_redaction(metrics.file_id, book))
+    excel.apply(plan.redacted_path, _blocks(plan))
+
+    finished = run(server.finish_redaction(metrics.file_id, plan.redacted_path, book))
+
+    rows = xlsx.read_rows(book, REDACTIONS)[1:]
+    assert len(rows) == 2
+    assert {row[2] for row in rows} == {finished.redacted_workbook_url}
+    assert all(row[3].startswith('https://drive.google.com/file/d/') for row in rows)
+
+
+def test_finish_uploads_into_the_requested_folder(drive, metrics, book, excel):
+    run(server.scan_workbook(metrics.file_id, book))
+    analyze_all(book)
+    plan = run(server.plan_redaction(metrics.file_id, book))
+    excel.apply(plan.redacted_path, _blocks(plan))
+
+    run(server.finish_redaction(metrics.file_id, plan.redacted_path, book, folder_id='shared1'))
+
+    assert drive.created[-1].parents == ('shared1',)

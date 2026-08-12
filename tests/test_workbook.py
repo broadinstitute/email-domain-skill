@@ -1,7 +1,10 @@
+"""The local analysis workbook: schema, upserts, and alias stability."""
+
 import random
 
 import pytest
 
+from email_domain_scrubber import xlsx
 from email_domain_scrubber.errors import SchemaMismatch
 from email_domain_scrubber.workbook import (
     DOMAIN_ANALYSIS,
@@ -17,173 +20,186 @@ from email_domain_scrubber.workbook import (
 )
 
 
-def test_create_writes_all_sheets_and_headers(backend):
-    workbook = AnalysisWorkbook.create(backend, 'Analysis')
+def test_open_creates_the_workbook_with_headers(tmp_path):
+    path = tmp_path / 'analysis.xlsx'
+    workbook = AnalysisWorkbook.open(path)
+
+    assert path.exists()
     assert workbook.sheet_titles == list(SHEET_ORDER)
     for name in SHEET_ORDER:
-        assert backend.sheet_values(workbook.spreadsheet_id, name)[0] == HEADERS[name]
+        assert xlsx.read_rows(path, name) == [HEADERS[name]]
 
 
-def test_open_adds_sheets_missing_from_an_existing_workbook(backend):
-    file = backend.add_spreadsheet('Analysis', {WORKBOOKS: [HEADERS[WORKBOOKS]]})
-    workbook = AnalysisWorkbook.open(backend, file.file_id)
-    assert workbook.sheet_titles == list(SHEET_ORDER)
-    assert backend.sheet_values(file.file_id, DOMAIN_ANALYSIS)[0] == HEADERS[DOMAIN_ANALYSIS]
+def test_open_is_idempotent_and_preserves_data(tmp_path):
+    path = tmp_path / 'analysis.xlsx'
+    first = AnalysisWorkbook.open(path)
+    first.store_analysis([('lab.io', 'High', 'a lab', None)], random.Random(1))
+
+    second = AnalysisWorkbook.open(path)
+
+    assert [row.domain for row in second.analysis_rows()] == ['lab.io']
+    assert second.sheet_titles == list(SHEET_ORDER)
 
 
-def test_open_rejects_a_workbook_with_conflicting_headers(backend):
-    file = backend.add_spreadsheet('Wrong', {WORKBOOKS: [['Name', 'Owner']]})
-    with pytest.raises(SchemaMismatch, match='Workbooks'):
-        AnalysisWorkbook.open(backend, file.file_id)
+def test_open_adds_a_missing_sheet_to_an_existing_workbook(tmp_path):
+    path = tmp_path / 'analysis.xlsx'
+    xlsx.create(path, {WORKBOOKS: [HEADERS[WORKBOOKS]]})
+
+    workbook = AnalysisWorkbook.open(path)
+
+    assert set(workbook.sheet_titles) >= set(SHEET_ORDER)
+    assert xlsx.read_rows(path, REDACTIONS) == [HEADERS[REDACTIONS]]
 
 
-def test_open_is_idempotent(backend):
-    created = AnalysisWorkbook.create(backend, 'Analysis')
-    reopened = AnalysisWorkbook.open(backend, created.spreadsheet_id)
-    assert reopened.sheet_titles == list(SHEET_ORDER)
-    assert backend.sheet_values(created.spreadsheet_id, WORKBOOKS) == [HEADERS[WORKBOOKS]]
+def test_mismatched_headers_are_rejected(tmp_path):
+    path = tmp_path / 'analysis.xlsx'
+    xlsx.create(path, {name: [HEADERS[name]] for name in SHEET_ORDER})
+    xlsx.rewrite(path, {DOMAIN_ANALYSIS: [['Something', 'Else']]})
+
+    with pytest.raises(SchemaMismatch, match=DOMAIN_ANALYSIS):
+        AnalysisWorkbook.open(path)
 
 
-def test_record_workbook_upserts_by_url(backend, analysis):
-    analysis.record_workbook('https://sheets/1', 'Q1 Metrics')
-    analysis.record_workbook('https://sheets/2', 'Q2 Metrics')
-    analysis.record_workbook('https://sheets/1', 'Q1 Metrics (renamed)')
+def test_record_workbook_upserts_by_url(analysis):
+    analysis.record_workbook('https://drive.google.com/file/d/abc/view', 'Q1')
+    analysis.record_workbook('https://drive.google.com/file/d/abc/view', 'Q1 renamed')
+    analysis.record_workbook('https://drive.google.com/file/d/def/view', 'Q2')
 
-    rows = backend.sheet_values(analysis.spreadsheet_id, WORKBOOKS)[1:]
-    assert rows == [
-        ['https://sheets/1', 'Q1 Metrics (renamed)'],
-        ['https://sheets/2', 'Q2 Metrics'],
+    assert analysis.scanned_workbooks() == {
+        'https://drive.google.com/file/d/abc/view': 'Q1 renamed',
+        'https://drive.google.com/file/d/def/view': 'Q2',
+    }
+
+
+def test_references_are_appended_once(analysis):
+    first = [
+        DomainReference('ref-a', 'lab.io', '2026-01-01'),
+        DomainReference('ref-b', 'lab.io', '2026-01-01'),
     ]
+    assert len(analysis.record_references(first)) == 2
+
+    again = analysis.record_references([*first, DomainReference('ref-c', 'lab.io', '2026-01-02')])
+
+    assert [ref.reference for ref in again] == ['ref-c']
+    assert analysis.reference_counts() == {'lab.io': 3}
 
 
-def test_record_references_skips_duplicates(analysis):
-    references = [
-        DomainReference('https://link#gid=0&range=A2', 'smithlab.io', '2026-08-04'),
-        DomainReference('https://link#gid=0&range=A3', 'smithlab.io', '2026-08-04'),
-    ]
-    assert len(analysis.record_references(references)) == 2
-    assert analysis.record_references(references) == []
-    assert analysis.reference_counts() == {'smithlab.io': 2}
+def test_reference_domains_are_matched_case_insensitively(analysis):
+    analysis.record_references([DomainReference('ref-a', 'Lab.IO', '2026-01-01')])
+    assert analysis.record_references([DomainReference('ref-a', 'lab.io', '2026-01-01')]) == []
 
 
-def test_multiple_references_per_domain_are_kept(backend, analysis):
+def test_sample_references_are_stable_and_capped(analysis):
     analysis.record_references(
-        [
-            DomainReference('ref-a', 'smithlab.io', '2026-08-04'),
-            DomainReference('ref-b', 'smithlab.io', '2026-08-04'),
-            DomainReference('ref-c', 'harvard.edu', '2026-08-04'),
-        ]
+        [DomainReference(f'ref-{index}', 'lab.io', '2026-01-01') for index in range(5)]
     )
-    rows = backend.sheet_values(analysis.spreadsheet_id, DOMAIN_REFERENCES)[1:]
-    assert len(rows) == 3
-    assert analysis.reference_counts() == {'smithlab.io': 2, 'harvard.edu': 1}
-    assert analysis.sample_references()['smithlab.io'] == ['ref-a', 'ref-b']
+
+    samples = analysis.sample_references()['lab.io']
+    assert samples == ['ref-0', 'ref-1', 'ref-2']
+    assert analysis.sample_references()['lab.io'] == samples
 
 
-def test_ensure_analysis_rows_creates_one_row_per_domain(backend, analysis):
-    added = analysis.ensure_analysis_rows(['smithlab.io', 'harvard.edu', 'SmithLab.io'])
-    assert added == ['smithlab.io', 'harvard.edu']
-
-    assert analysis.ensure_analysis_rows(['harvard.edu']) == []
-    rows = backend.sheet_values(analysis.spreadsheet_id, DOMAIN_ANALYSIS)[1:]
-    assert [row[0] for row in rows] == ['smithlab.io', 'harvard.edu']
+def test_ensure_analysis_rows_adds_only_unseen_domains(analysis):
+    assert analysis.ensure_analysis_rows(['a.org', 'b.org', 'a.org']) == ['a.org', 'b.org']
+    assert analysis.ensure_analysis_rows(['b.org', 'c.org']) == ['c.org']
+    assert [row.domain for row in analysis.analysis_rows()] == ['a.org', 'b.org', 'c.org']
 
 
-def test_scan_leaves_anonymized_domain_blank_until_analysis(backend, analysis):
-    analysis.ensure_analysis_rows(['smithlab.io'])
-    row = backend.sheet_values(analysis.spreadsheet_id, DOMAIN_ANALYSIS)[1]
-    assert row == ['smithlab.io', '', '', '']
-    assert analysis.pending_domains()[0].domain == 'smithlab.io'
+def test_pending_domains_are_those_without_a_risk(analysis):
+    analysis.ensure_analysis_rows(['a.org', 'b.org'])
+    analysis.store_analysis([('a.org', 'Low', 'known org', None)], random.Random(1))
+
+    assert [row.domain for row in analysis.pending_domains()] == ['b.org']
 
 
-def test_store_analysis_assigns_a_token_to_high_risk_only(backend, analysis):
-    analysis.ensure_analysis_rows(['smithlab.io', 'pluralistic.net', 'broadinstitute.org'])
-    analysis.store_analysis(
-        [
-            ('smithlab.io', 'High', 'Personal lab domain', None),
-            ('pluralistic.net', 'Medium', 'Single-author blog', None),
-            ('broadinstitute.org', 'Low', 'Broad Institute', None),
-        ],
+def test_high_risk_gets_an_alias_and_low_risk_does_not(analysis):
+    stored = analysis.store_analysis(
+        [('lab.io', 'High', 'a person', None), ('broad.org', 'Low', 'an org', None)],
         random.Random(7),
     )
 
-    rows = {
-        row[0]: row for row in backend.sheet_values(analysis.spreadsheet_id, DOMAIN_ANALYSIS)[1:]
-    }
-    assert rows['smithlab.io'][1] == 'High'
-    assert rows['smithlab.io'][3].startswith('anon')
-    assert rows['pluralistic.net'][3] == ''
-    assert rows['broadinstitute.org'][3] == ''
-    assert analysis.pending_domains() == []
+    by_domain = {row.domain: row for row in stored}
+    assert by_domain['lab.io'].anonymized_domain.startswith('anon')
+    assert by_domain['broad.org'].anonymized_domain == ''
 
 
-def test_store_analysis_honours_an_explicit_anonymize_flag(analysis):
-    analysis.ensure_analysis_rows(['tinylab.org', 'famous.com'])
-    analysis.store_analysis(
-        [
-            ('tinylab.org', 'Medium', 'Two-person lab', True),
-            ('famous.com', 'High', 'Named person, but already public', False),
-        ],
+def test_an_explicit_anonymize_flag_overrides_the_risk_default(analysis):
+    stored = analysis.store_analysis(
+        [('low.org', 'Low', 'asked for anyway', True), ('high.io', 'High', 'not this time', False)],
         random.Random(3),
     )
-    mapping = analysis.anonymized_mapping()
-    assert 'tinylab.org' in mapping
-    assert 'famous.com' not in mapping
+
+    by_domain = {row.domain: row for row in stored}
+    assert by_domain['low.org'].anonymized_domain.startswith('anon')
+    assert by_domain['high.io'].anonymized_domain == ''
 
 
-def test_store_analysis_retains_an_existing_token(analysis):
-    analysis.ensure_analysis_rows(['smithlab.io'])
-    analysis.store_analysis([('smithlab.io', 'High', 'first pass', None)], random.Random(1))
-    first = analysis.anonymized_mapping()['smithlab.io']
+def test_an_alias_survives_a_later_downgrade(analysis):
+    first = analysis.store_analysis([('lab.io', 'High', 'a person', None)], random.Random(1))
+    alias = first[0].anonymized_domain
 
-    analysis.store_analysis([('smithlab.io', 'Medium', 'second pass', None)], random.Random(99))
-    assert analysis.anonymized_mapping()['smithlab.io'] == first
-    assert analysis.analysis_by_domain()['smithlab.io'].explanation == 'second pass'
+    second = analysis.store_analysis([('lab.io', 'Low', 'actually an org', None)], random.Random(2))
 
-
-def test_store_analysis_updates_in_place_without_adding_rows(backend, analysis):
-    analysis.ensure_analysis_rows(['a.org', 'b.org'])
-    analysis.store_analysis([('b.org', 'Low', 'known org', None)], random.Random(1))
-    analysis.store_analysis([('b.org', 'Low', 'known org, reconfirmed', None)], random.Random(1))
-
-    rows = backend.sheet_values(analysis.spreadsheet_id, DOMAIN_ANALYSIS)[1:]
-    assert [row[0] for row in rows] == ['a.org', 'b.org']
-    assert rows[1][2] == 'known org, reconfirmed'
+    assert second[0].risk == 'Low'
+    assert second[0].anonymized_domain == alias
+    assert analysis.anonymized_mapping() == {'lab.io': alias}
 
 
-def test_store_analysis_creates_a_row_for_an_unscanned_domain(backend, analysis):
-    analysis.store_analysis([('surprise.io', 'High', 'not from a scan', None)], random.Random(1))
-    rows = backend.sheet_values(analysis.spreadsheet_id, DOMAIN_ANALYSIS)[1:]
-    assert rows[0][0] == 'surprise.io'
+def test_restoring_updates_in_place_rather_than_appending(analysis):
+    analysis.store_analysis([('lab.io', 'High', 'first pass', None)], random.Random(1))
+    analysis.store_analysis([('lab.io', 'High', 'second pass', None)], random.Random(1))
+
+    rows = analysis.analysis_rows()
+    assert len(rows) == 1
+    assert rows[0].explanation == 'second pass'
 
 
-def test_store_analysis_does_not_reuse_a_token(analysis):
-    domains = [f'lab{index}.org' for index in range(50)]
-    analysis.ensure_analysis_rows(domains)
-    analysis.store_analysis(
-        [(domain, 'High', 'personal lab', None) for domain in domains], random.Random(11)
+def test_store_analysis_fills_a_row_opened_by_scanning(analysis):
+    analysis.ensure_analysis_rows(['lab.io'])
+    analysis.store_analysis([('LAB.IO', 'High', 'a person', None)], random.Random(1))
+
+    rows = analysis.analysis_rows()
+    assert len(rows) == 1
+    assert rows[0].domain == 'lab.io'
+
+
+def test_aliases_are_unique_across_domains(analysis):
+    stored = analysis.store_analysis(
+        [(f'lab{index}.io', 'High', 'a person', None) for index in range(25)], random.Random(11)
     )
-    tokens = list(analysis.anonymized_mapping().values())
-    assert len(tokens) == len(set(tokens)) == 50
+    aliases = [row.anonymized_domain for row in stored]
+    assert len(set(aliases)) == 25
 
 
-def test_store_analysis_rejects_a_risk_outside_the_taxonomy(analysis):
+def test_an_invalid_risk_is_rejected(analysis):
     with pytest.raises(ValueError, match='Critical'):
-        analysis.store_analysis([('x.org', 'Critical', 'nope', None)], random.Random(1))
+        analysis.store_analysis([('lab.io', 'Critical', 'nope', None)], random.Random(1))
 
 
-@pytest.mark.parametrize(('given', 'expected'), [('high', 'High'), ('  LOW ', 'Low')])
-def test_normalize_risk(given, expected):
-    assert normalize_risk(given) == expected
+def test_normalize_risk_canonicalizes_case():
+    assert normalize_risk(' high ') == 'High'
+    assert normalize_risk('LOW') == 'Low'
 
 
-def test_record_redactions_appends(backend, analysis):
+def test_record_redactions_appends_rows(analysis):
     analysis.record_redactions(
         [
-            RedactionRecord('src', 'dst', 'ref-a', 'smithlab.io', 'anon0001', '2026-08-04'),
-            RedactionRecord('src', 'dst', 'ref-b', 'smithlab.io', 'anon0001', '2026-08-04'),
+            RedactionRecord('src', 'dst', 'ref-1', 'lab.io', 'anon0001', '2026-02-01'),
+            RedactionRecord('src', 'dst', 'ref-2', 'lab.io', 'anon0001', '2026-02-01'),
         ]
     )
-    rows = backend.sheet_values(analysis.spreadsheet_id, REDACTIONS)[1:]
+
+    rows = xlsx.read_rows(analysis.path, REDACTIONS)[1:]
     assert len(rows) == 2
-    assert rows[0] == ['2026-08-04', 'src', 'dst', 'ref-a', 'smithlab.io', 'anon0001']
+    assert rows[0] == ['2026-02-01', 'src', 'dst', 'ref-1', 'lab.io', 'anon0001']
+
+
+def test_writes_to_one_sheet_do_not_disturb_another(analysis):
+    analysis.record_references([DomainReference('ref-a', 'lab.io', '2026-01-01')])
+    analysis.store_analysis([('lab.io', 'High', 'a person', None)], random.Random(1))
+    analysis.record_workbook('https://drive.google.com/file/d/abc/view', 'Q1')
+
+    assert analysis.reference_counts() == {'lab.io': 1}
+    assert len(analysis.analysis_rows()) == 1
+    assert len(analysis.scanned_workbooks()) == 1
+    assert xlsx.read_rows(analysis.path, DOMAIN_REFERENCES)[0] == HEADERS[DOMAIN_REFERENCES]

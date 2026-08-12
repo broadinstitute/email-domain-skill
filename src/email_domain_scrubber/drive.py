@@ -1,0 +1,255 @@
+"""Google Drive access, entirely through Google's Drive MCP connector.
+
+The connector at `https://drivemcp.googleapis.com/mcp/v1` replaces what used to be a
+hand-written wrapper over the Drive v3 and Sheets v4 REST APIs. This module is an MCP *client*
+of it, which keeps file bytes out of the model's context: `download_file_content` hands back
+base64, and a 1 MB workbook would be some 350k tokens if it travelled through the conversation.
+
+The connector's surface is deliberately small and read-mostly — `search_files`,
+`get_file_metadata`, `get_file_permissions`, `list_recent_files`, `read_file_content`,
+`download_file_content`, `create_file`, `copy_file`. Notably there is **no update, delete, or
+move**, which is why redaction always creates a new file and why the analysis workbook is kept
+locally rather than in Drive.
+
+Two protocol quirks, both confirmed against the live endpoint:
+
+* Errors arrive as HTTP 403 with a *valid* JSON-RPC body, so the body must be read on non-2xx
+  rather than treated as a transport failure.
+* A failed tool call is reported as ``result.isError`` with the message in text content, not as
+  a JSON-RPC error, so success has to be checked per call rather than per response.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import re
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from .auth import TokenSource
+from .errors import (
+    AccessDenied,
+    DriveMcpApiDisabled,
+    DriveMcpError,
+    InvalidWorkbookReference,
+    MissingScopes,
+    WorkbookNotFound,
+)
+
+ENDPOINT = 'https://drivemcp.googleapis.com/mcp/v1'
+
+#: The only workbook format this server handles. Google Sheets and CSV are out of scope.
+XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+_DRIVE_URL_ID = re.compile(r'(?:/file/d/|/spreadsheets/d/|[?&]id=)([A-Za-z0-9_-]+)')
+_BARE_ID = re.compile(r'^[A-Za-z0-9_-]{20,}$')
+
+
+def parse_file_id(url_or_id: str) -> str:
+    """Extract a Drive file id from a Drive URL, or accept a bare id."""
+    value = (url_or_id or '').strip()
+    if not value:
+        raise InvalidWorkbookReference('No workbook URL or id was provided.')
+    match = _DRIVE_URL_ID.search(value)
+    if match:
+        return match.group(1)
+    if _BARE_ID.match(value):
+        return value
+    raise InvalidWorkbookReference(
+        f'{value!r} is not a Google Drive URL or file id. Expected something like '
+        'https://drive.google.com/file/d/<id>/view'
+    )
+
+
+def file_url(file_id: str) -> str:
+    return f'https://drive.google.com/file/d/{file_id}/view'
+
+
+def cell_reference(file_id: str, sheet_title: str, a1: str) -> str:
+    """A locator for one cell of a Drive-hosted workbook.
+
+    A Google Sheet could be deep-linked to a selected cell with `#gid=…&range=…`. An `.xlsx` in
+    Drive has no such link, so the URL opens the file and the fragment names the cell for a
+    human reading the audit trail.
+    """
+    return f'{file_url(file_id)}#{sheet_title}!{a1}'
+
+
+@dataclass(frozen=True)
+class FileInfo:
+    file_id: str
+    name: str
+    mime_type: str
+    modified_time: str = ''
+    parents: tuple[str, ...] = ()
+
+    @property
+    def is_xlsx(self) -> bool:
+        return self.mime_type == XLSX_MIME or self.name.lower().endswith('.xlsx')
+
+
+class Drive(Protocol):
+    """The Drive surface this package depends on — four operations, all via the connector."""
+
+    async def get_metadata(self, file_id: str) -> FileInfo: ...
+
+    async def download(self, file_id: str) -> bytes: ...
+
+    async def create(
+        self, name: str, content: bytes, *, mime_type: str = XLSX_MIME, parent_id: str | None = None
+    ) -> FileInfo: ...
+
+    async def search(self, query: str, *, page_size: int = 10) -> list[FileInfo]: ...
+
+
+def _first_text(content: Any) -> str:
+    """The text payload of an MCP tool result, whichever shape the SDK hands back."""
+    for block in content or []:
+        text = getattr(block, 'text', None)
+        if text is None and isinstance(block, dict):
+            text = block.get('text')
+        if text:
+            return str(text)
+    return ''
+
+
+def _classify(tool: str, detail: str) -> Exception:
+    """Turn a connector failure into the most actionable error we can name."""
+    lowered = detail.lower()
+    if 'drive mcp api has not been used' in lowered or 'drivemcp.googleapis.com' in lowered:
+        return DriveMcpApiDisabled(detail)
+    if 'scope' in lowered and ('insufficient' in lowered or 'required' in lowered):
+        return MissingScopes(detail)
+    if 'not found' in lowered or 'notfound' in lowered or '404' in lowered:
+        return WorkbookNotFound(
+            f'Google could not find the file: {detail}. Check the id, and that the file is '
+            'shared with the signed-in account.'
+        )
+    if 'permission' in lowered or 'forbidden' in lowered or 'denied' in lowered:
+        return AccessDenied(
+            f'Google denied access: {detail}. The server acts as the signed-in user, so make '
+            'sure that account can open the file — and, to upload, the destination folder.'
+        )
+    return DriveMcpError(tool, detail)
+
+
+class DriveMcpClient:
+    """`Drive` backed by the live connector.
+
+    A session is opened per call rather than held open. The connector identifies itself as a
+    `StatelessServer` and returns no session id, so there is nothing to keep alive, and a
+    long-lived MCP server that cached a session would have to handle its own reconnection.
+    """
+
+    def __init__(self, endpoint: str = ENDPOINT, tokens: TokenSource | None = None) -> None:
+        self._endpoint = endpoint
+        self._tokens = tokens or TokenSource()
+
+    async def _call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        import httpx2
+        from mcp import Client
+        from mcp.client.streamable_http import StreamableHTTPTransport
+
+        token = await self._tokens.token()
+        async with httpx2.AsyncClient(
+            timeout=120, headers={'Authorization': f'Bearer {token}'}
+        ) as http:
+            transport = StreamableHTTPTransport(self._endpoint, http_client=http)
+            async with Client(transport) as client:
+                result = await client.call_tool(tool, arguments)
+
+        if getattr(result, 'isError', False):
+            raise _classify(tool, _first_text(result.content) or 'no detail given')
+        structured = getattr(result, 'structuredContent', None)
+        if isinstance(structured, dict):
+            return structured
+        return _parse_json(_first_text(result.content), tool)
+
+    async def get_metadata(self, file_id: str) -> FileInfo:
+        payload = await self._call('get_file_metadata', {'fileId': file_id})
+        return _file_info(payload, fallback_id=file_id)
+
+    async def download(self, file_id: str) -> bytes:
+        payload = await self._call('download_file_content', {'fileId': file_id})
+        encoded = _pick(payload, 'base64Content', 'content', 'data', 'fileContent')
+        if not encoded:
+            raise DriveMcpError('download_file_content', f'no content returned for {file_id}')
+        try:
+            return base64.b64decode(encoded, validate=False)
+        except (binascii.Error, ValueError) as exc:
+            raise DriveMcpError(
+                'download_file_content', f'content for {file_id} was not valid base64: {exc}'
+            ) from exc
+
+    async def create(
+        self, name: str, content: bytes, *, mime_type: str = XLSX_MIME, parent_id: str | None = None
+    ) -> FileInfo:
+        arguments: dict[str, Any] = {
+            'title': name,
+            'base64Content': base64.b64encode(content).decode('ascii'),
+            'contentMimeType': mime_type,
+            # Without this an uploaded .xlsx is silently converted to a Google Sheet, and this
+            # server's whole contract is that the published artefact is an Excel workbook.
+            'disableConversionToGoogleType': True,
+        }
+        if parent_id:
+            arguments['parentId'] = parent_id
+        return _file_info(await self._call('create_file', arguments), fallback_id='')
+
+    async def search(self, query: str, *, page_size: int = 10) -> list[FileInfo]:
+        payload = await self._call('search_files', {'query': query, 'pageSize': page_size})
+        files = payload.get('files') or payload.get('results') or []
+        return [_file_info(entry, fallback_id='') for entry in files if isinstance(entry, dict)]
+
+    async def list_tools(self) -> list[str]:
+        """Tool names the connector advertises. Used by `check-auth` to prove reachability."""
+        import httpx2
+        from mcp import Client
+        from mcp.client.streamable_http import StreamableHTTPTransport
+
+        token = await self._tokens.token()
+        async with httpx2.AsyncClient(
+            timeout=60, headers={'Authorization': f'Bearer {token}'}
+        ) as http:
+            transport = StreamableHTTPTransport(self._endpoint, http_client=http)
+            async with Client(transport) as client:
+                listed = await client.list_tools()
+        return sorted(tool.name for tool in listed.tools)
+
+
+def _parse_json(text: str, tool: str) -> dict[str, Any]:
+    import json
+
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise DriveMcpError(tool, f'unparseable response: {text[:200]}') from exc
+    return parsed if isinstance(parsed, dict) else {'value': parsed}
+
+
+def _pick(payload: dict[str, Any], *keys: str) -> str:
+    """First non-empty string among `keys`, at the top level or under a `file` wrapper."""
+    for source in (payload, payload.get('file') or {}):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ''
+
+
+def _file_info(payload: dict[str, Any], *, fallback_id: str) -> FileInfo:
+    parents = payload.get('parents') or (payload.get('file') or {}).get('parents') or ()
+    if isinstance(parents, str):
+        parents = (parents,)
+    return FileInfo(
+        file_id=_pick(payload, 'id', 'fileId') or fallback_id,
+        name=_pick(payload, 'name', 'title'),
+        mime_type=_pick(payload, 'mimeType', 'contentMimeType'),
+        modified_time=_pick(payload, 'modifiedTime', 'modifiedAt'),
+        parents=tuple(str(parent) for parent in parents),
+    )

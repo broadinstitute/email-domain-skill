@@ -1,72 +1,79 @@
-"""MCP server for scanning, recording, and anonymizing email domains in metrics workbooks.
+"""MCP server for scanning, recording, and anonymizing email domains in Excel metrics reports.
 
-Division of labour: this server does everything deterministic and auditable — finding domains,
-persisting them, minting aliases, rewriting cells. The analysis skill does the judgement —
-deciding each domain's `Risk` and whether it needs anonymizing — and gets user approval before
-calling `store_domain_analysis` or `redact_workbook`.
+Division of labour, now across three servers:
+
+* **This server** does everything deterministic and auditable — fetching workbooks from Drive
+  through Google's Drive MCP connector, finding domains, persisting them, minting aliases,
+  planning the redaction, and verifying it landed.
+* **The Excel MCP server** applies the planned writes to the copied workbook. Point it at the
+  `redacted_path` and `write_blocks` that `plan_redaction` returns.
+* **The analysis skill** does the judgement — deciding each domain's `Risk` and whether it needs
+  anonymizing — and gets user approval before calling `store_domain_analysis` or
+  `finish_redaction`.
 """
 
 from __future__ import annotations
 
-import os
+from pathlib import Path
 from typing import Annotated, Literal
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel, Field
 
 from . import redact as redaction
-from .auth import google_backend
-from .errors import InvalidWorkbookReference
-from .scan import resolve_workbook, scan_spreadsheet, unique_domains
-from .sheets import SheetsBackend, parse_file_id, spreadsheet_url
-from .workbook import DEFAULT_TITLE, RISKS, AnalysisWorkbook, DomainReference, today
-
-#: Set this so callers can omit `analysis_workbook` on every call.
-ANALYSIS_WORKBOOK_ENV = 'EMAIL_DOMAIN_ANALYSIS_WORKBOOK'
+from .drive import Drive, DriveMcpClient
+from .scan import scan_path, stage_workbook, unique_domains
+from .staging import ANALYSIS_WORKBOOK_ENV, Staging, analysis_workbook_path
+from .workbook import RISKS, AnalysisWorkbook, DomainReference, today
 
 mcp = MCPServer(
     'email-domain-scrubber',
     instructions=(
-        'Tools for the email domain privacy workflow on platform usage metric reports. '
-        'Typical order: scan_workbook -> list_domains_for_analysis -> (analyze, then get user '
-        'approval) -> store_domain_analysis -> redact_workbook. The analysis workbook is the '
-        'durable record; pass its URL to every tool or set the '
-        f'{ANALYSIS_WORKBOOK_ENV} environment variable.'
+        'Tools for the email domain privacy workflow on Excel (.xlsx) usage metric reports in '
+        'Google Drive. Typical order: scan_workbook -> list_domains_for_analysis -> (analyze, '
+        'then get user approval) -> store_domain_analysis -> plan_redaction -> apply every '
+        'returned write block with the Excel MCP server write_data_to_excel tool -> '
+        'finish_redaction. The analysis workbook is a local .xlsx holding the durable record; '
+        f'pass its path to every tool or set the {ANALYSIS_WORKBOOK_ENV} environment variable.'
     ),
 )
 
-_backend_override: SheetsBackend | None = None
+_drive_override: Drive | None = None
+_staging_override: Staging | None = None
 
 
-def set_backend(backend: SheetsBackend | None) -> None:
-    """Inject a backend (used by tests); `None` restores live Google access."""
-    global _backend_override
-    _backend_override = backend
+def set_backend(drive: Drive | None, staging: Staging | None = None) -> None:
+    """Inject a Drive client and staging root (used by tests); `None` restores live access."""
+    global _drive_override, _staging_override
+    _drive_override = drive
+    _staging_override = staging
 
 
-def _backend() -> SheetsBackend:
-    return _backend_override if _backend_override is not None else google_backend()
+def _drive() -> Drive:
+    return _drive_override if _drive_override is not None else DriveMcpClient()
+
+
+def _staging() -> Staging:
+    return _staging_override if _staging_override is not None else Staging()
 
 
 def _open_analysis(analysis_workbook: str | None) -> AnalysisWorkbook:
-    reference = (analysis_workbook or os.environ.get(ANALYSIS_WORKBOOK_ENV) or '').strip()
-    if not reference:
-        raise InvalidWorkbookReference(
-            'No analysis workbook given. Pass analysis_workbook, set the '
-            f'{ANALYSIS_WORKBOOK_ENV} environment variable, or call '
-            'create_analysis_workbook to make one.'
-        )
-    return AnalysisWorkbook.open(_backend(), parse_file_id(reference))
+    return AnalysisWorkbook.open(analysis_workbook_path(analysis_workbook))
 
 
 WorkbookUrl = Annotated[
-    str, Field(description='Google Sheets URL, Drive URL, or file id of the metrics workbook.')
+    str,
+    Field(
+        description='Google Drive URL or file id of the .xlsx metrics workbook. Google Sheets '
+        'and CSV files are not supported.'
+    ),
 ]
-AnalysisWorkbookUrl = Annotated[
+AnalysisWorkbookPath = Annotated[
     str | None,
     Field(
-        description='URL or id of the domain analysis workbook. Defaults to the '
-        f'{ANALYSIS_WORKBOOK_ENV} environment variable.'
+        description='Path to the local domain analysis workbook (.xlsx). Defaults to the '
+        f'{ANALYSIS_WORKBOOK_ENV} environment variable, then to analysis.xlsx in the work '
+        'directory. Created on first use.'
     ),
 ]
 
@@ -81,19 +88,18 @@ class DomainSummary(BaseModel):
     )
     reference_count: int = Field(default=0, description='Cells this domain was found in.')
     example_references: list[str] = Field(
-        default_factory=list, description='Direct links to a few of those cells.'
+        default_factory=list, description='Locators for a few of those cells.'
     )
 
 
 class ScanResult(BaseModel):
     scanned_workbook_url: str
     scanned_workbook_title: str
-    converted_from_upload: bool = Field(
-        default=False,
-        description='True if a Drive XLSX/CSV upload was converted to a Google Sheet in order '
-        'to be scanned and linked; scanned_workbook_url points at that conversion.',
+    local_path: str = Field(description='Where the workbook was staged on disk.')
+    downloaded: bool = Field(
+        description='False if an up-to-date local copy was reused instead of re-downloading.'
     )
-    analysis_workbook_url: str
+    analysis_workbook_path: str
     domains_found: int
     new_domains: list[str] = Field(description='Domains seen here for the first time.')
     pending_analysis: list[str] = Field(description='All domains still awaiting a Risk verdict.')
@@ -109,7 +115,7 @@ class StoredAnalysis(BaseModel):
 
 
 class StoreResult(BaseModel):
-    analysis_workbook_url: str
+    analysis_workbook_path: str
     stored: list[StoredAnalysis]
     still_pending: list[str]
 
@@ -121,84 +127,78 @@ class RedactionCell(BaseModel):
     after: str
 
 
-class RedactionResult(BaseModel):
-    dry_run: bool
+class WriteBlockOut(BaseModel):
+    """One `write_data_to_excel` call for the Excel MCP server."""
+
+    sheet_name: str = Field(description='Pass as `sheet_name`.')
+    start_cell: str = Field(description='Pass as `start_cell`.')
+    data: list[list[str]] = Field(description='Pass as `data`. Rows of a single column.')
+
+
+class PlanResult(BaseModel):
     source_workbook_url: str
-    redacted_workbook_url: str = Field(
-        default='', description='The anonymized copy. Empty on a dry run.'
+    redacted_path: str = Field(
+        description='The copy to edit. Pass as `filepath` to write_data_to_excel. Empty if '
+        'there is nothing to change.'
     )
-    redacted_workbook_title: str = ''
-    cells_changed: int
+    cells_to_change: int
+    write_blocks: list[WriteBlockOut] = Field(
+        description='Apply every one of these with the Excel MCP server write_data_to_excel '
+        'tool, then call finish_redaction. Applying only some leaves domains exposed, which '
+        'finish_redaction will reject.'
+    )
     domains_anonymized: dict[str, str] = Field(
-        default_factory=dict, description='Domain -> alias, for domains actually replaced.'
+        default_factory=dict, description='Domain -> alias, for domains that will be replaced.'
     )
     domains_left_as_is: list[str] = Field(
         default_factory=list,
         description='Analyzed as not needing anonymization, so intentionally untouched.',
     )
-    sample_changes: list[RedactionCell] = Field(default_factory=list)
-    remaining_domains: list[str] = Field(
-        default_factory=list,
-        description='Domains still present in the copy after redaction — the ones left as is, '
-        'plus anything a re-scan turned up. Verify this looks expected before publishing.',
+    sample_changes: list[RedactionCell] = Field(
+        default_factory=list, description='A few before/after examples to show the user.'
     )
 
 
-class WorkbookCreated(BaseModel):
-    analysis_workbook_url: str
-    title: str
-    sheets: list[str]
+class FinishResult(BaseModel):
+    source_workbook_url: str
+    redacted_workbook_url: str = Field(description='The published .xlsx in Drive.')
+    redacted_workbook_title: str
+    cells_changed: int
+    domains_anonymized: dict[str, str] = Field(default_factory=dict)
+    domains_left_as_is: list[str] = Field(default_factory=list)
+    remaining_domains: list[str] = Field(
+        default_factory=list,
+        description='Domains still present in the published copy — the ones left as is, plus '
+        'anything a re-scan turned up. Verify this looks expected before sharing the file.',
+    )
+    redactions_recorded: int
 
 
 # -- tools -------------------------------------------------------------------------------------
 @mcp.tool()
-def create_analysis_workbook(
-    title: Annotated[str, Field(description='Title for the new workbook.')] = DEFAULT_TITLE,
-    folder_id: Annotated[
-        str | None,
-        Field(
-            description='Drive folder or shared drive id to create it in. Defaults to the '
-            "user's My Drive."
-        ),
-    ] = None,
-) -> WorkbookCreated:
-    """Create an empty domain analysis workbook with the required sheets and headers.
-
-    Use once per project. Save the returned URL (or set it as the
-    EMAIL_DOMAIN_ANALYSIS_WORKBOOK environment variable) and reuse it for every later call so
-    analysis and aliases accumulate in one place. Pass folder_id to keep it beside the metrics
-    reports on a shared drive rather than in your own My Drive.
-    """
-    workbook = AnalysisWorkbook.create(_backend(), title, folder_id)
-    return WorkbookCreated(
-        analysis_workbook_url=workbook.url, title=workbook.title, sheets=workbook.sheet_titles
-    )
-
-
-@mcp.tool()
-def scan_workbook(
-    workbook: WorkbookUrl, analysis_workbook: AnalysisWorkbookUrl = None
+async def scan_workbook(
+    workbook: WorkbookUrl, analysis_workbook: AnalysisWorkbookPath = None
 ) -> ScanResult:
-    """Find every email domain in a metrics workbook and record it for analysis.
+    """Find every email domain in an Excel metrics workbook and record it for analysis.
 
-    Reads all cells of all sheets, extracting domains from email addresses and from bare domain
-    values. Each occurrence is appended to DomainReferences with a direct link to its cell, and
-    each unique domain gets a DomainAnalysis row with an empty Risk. Re-scanning the same
-    workbook is safe: existing references and verdicts are preserved.
+    Downloads the .xlsx from Drive through the Drive MCP connector into the local work
+    directory, then reads all cells of all sheets, extracting domains from email addresses and
+    from bare domain values. Each occurrence is appended to DomainReferences with a locator for
+    its cell, and each unique domain gets a DomainAnalysis row with an empty Risk.
 
-    A Drive XLSX/CSV upload is converted to a Google Sheet first, since only native sheets can
-    be read cell-by-cell and linked to.
+    Re-scanning the same workbook is safe: existing references and verdicts are preserved, and
+    an unchanged workbook is not re-downloaded. The analysis workbook is created if absent.
     """
-    backend = _backend()
+    drive = _drive()
+    staging = _staging()
     analysis = _open_analysis(analysis_workbook)
-    resolved = resolve_workbook(backend, workbook)
+    staged = await stage_workbook(drive, staging, workbook)
 
-    hits = scan_spreadsheet(backend, resolved.info)
+    hits = scan_path(staged.path, staged.info.file_id)
     domains = unique_domains(hits)
     date = today()
 
-    scanned_url = spreadsheet_url(resolved.info.spreadsheet_id)
-    analysis.record_workbook(scanned_url, resolved.info.title)
+    analysis.record_workbook(staged.url, staged.info.name)
     recorded = analysis.record_references(
         [
             DomainReference(reference=hit.reference, domain=hit.domain, date_extracted=date)
@@ -208,10 +208,11 @@ def scan_workbook(
     new_domains = analysis.ensure_analysis_rows(domains)
 
     return ScanResult(
-        scanned_workbook_url=scanned_url,
-        scanned_workbook_title=resolved.info.title,
-        converted_from_upload=resolved.converted,
-        analysis_workbook_url=analysis.url,
+        scanned_workbook_url=staged.url,
+        scanned_workbook_title=staged.info.name,
+        local_path=str(staged.path),
+        downloaded=staged.downloaded,
+        analysis_workbook_path=analysis.url,
         domains_found=len(domains),
         new_domains=new_domains,
         pending_analysis=[row.domain for row in analysis.pending_domains()],
@@ -222,7 +223,7 @@ def scan_workbook(
 
 @mcp.tool()
 def list_domains_for_analysis(
-    analysis_workbook: AnalysisWorkbookUrl = None,
+    analysis_workbook: AnalysisWorkbookPath = None,
     include_analyzed: Annotated[
         bool, Field(description='Also return domains that already have a Risk recorded.')
     ] = False,
@@ -230,7 +231,7 @@ def list_domains_for_analysis(
     """List the domains to analyze, with how often and where each was seen.
 
     By default returns only domains with no Risk yet — the work queue for the risk analysis
-    skill. Example references are direct cell links, useful for seeing a domain in context.
+    skill. Example references locate a cell, useful for seeing a domain in context.
     """
     analysis = _open_analysis(analysis_workbook)
     counts = analysis.reference_counts()
@@ -278,7 +279,7 @@ def store_domain_analysis(
     analyses: Annotated[
         list[AnalysisInput], Field(description='One entry per analyzed domain.', min_length=1)
     ],
-    analysis_workbook: AnalysisWorkbookUrl = None,
+    analysis_workbook: AnalysisWorkbookPath = None,
 ) -> StoreResult:
     """Record approved risk verdicts, assigning an alias to each domain to be anonymized.
 
@@ -291,7 +292,7 @@ def store_domain_analysis(
         [(entry.domain, entry.risk, entry.explanation, entry.anonymize) for entry in analyses]
     )
     return StoreResult(
-        analysis_workbook_url=analysis.url,
+        analysis_workbook_path=analysis.url,
         stored=[
             StoredAnalysis(
                 domain=row.domain,
@@ -306,59 +307,114 @@ def store_domain_analysis(
 
 
 @mcp.tool()
-def redact_workbook(
-    workbook: WorkbookUrl,
-    analysis_workbook: AnalysisWorkbookUrl = None,
-    dry_run: Annotated[
-        bool, Field(description='Report what would change without copying or writing anything.')
-    ] = False,
-) -> RedactionResult:
-    """Write an anonymized copy of a metrics workbook, replacing domains with their aliases.
+async def plan_redaction(
+    workbook: WorkbookUrl, analysis_workbook: AnalysisWorkbookPath = None
+) -> PlanResult:
+    """Copy the workbook locally and return the cell writes that anonymize it.
 
-    The source workbook is never modified — this copies it to "<title> (anonymized)" and edits
-    the copy. Only domains whose analysis assigned an alias are replaced; domains analyzed as
-    not needing anonymization are left in place on purpose. Fails if any domain in the workbook
-    has no recorded analysis, so nothing unreviewed can be published.
+    Nothing is published and neither the Drive original nor the staged copy of it is modified.
+    This makes `<name> (anonymized).xlsx` beside the staged workbook and tells you what to write
+    into it; the Excel MCP server does the writing.
 
-    Every rewritten cell is appended to the Redactions sheet of the analysis workbook. Run with
-    dry_run=true first to show the user what will change.
+    Only domains whose analysis assigned an alias are replaced; domains analyzed as not needing
+    anonymization are left in place on purpose. Fails if any domain in the workbook has no
+    recorded analysis, so nothing unreviewed can be published.
+
+    Show the user `cells_to_change` and `sample_changes` and get approval. Then pass each entry
+    of `write_blocks` to the Excel MCP server's write_data_to_excel with `filepath` set to
+    `redacted_path`, and finally call finish_redaction.
     """
-    backend = _backend()
+    drive = _drive()
+    staging = _staging()
     analysis = _open_analysis(analysis_workbook)
-    resolved = resolve_workbook(backend, workbook)
-    hits = scan_spreadsheet(backend, resolved.info)
-    plan = redaction.plan_redaction(resolved, hits, analysis)
+    staged = await stage_workbook(drive, staging, workbook)
+    hits = scan_path(staged.path, staged.info.file_id)
+    plan = redaction.plan_redaction(staged, hits, analysis)
+    copy = redaction.create_copy(staged, staging) if plan.edits else None
 
-    samples = [
-        RedactionCell(sheet=edit.sheet_title, cell=edit.a1, before=edit.before, after=edit.after)
-        for edit in plan.edits[:10]
-    ]
+    return PlanResult(
+        source_workbook_url=plan.source_url,
+        redacted_path=str(copy) if copy else '',
+        cells_to_change=plan.cells_to_change,
+        write_blocks=[
+            WriteBlockOut(sheet_name=block.sheet, start_cell=block.start_cell, data=block.values)
+            for block in plan.blocks
+        ],
+        domains_anonymized=plan.mapped_domains,
+        domains_left_as_is=plan.left_as_is,
+        sample_changes=[
+            RedactionCell(
+                sheet=edit.sheet_title, cell=edit.a1, before=edit.before, after=edit.after
+            )
+            for edit in plan.edits[:10]
+        ],
+    )
 
-    if dry_run:
-        return RedactionResult(
-            dry_run=True,
-            source_workbook_url=plan.source_url,
-            cells_changed=plan.cells_to_change,
-            domains_anonymized=plan.mapped_domains,
-            domains_left_as_is=plan.left_as_is,
-            sample_changes=samples,
-            remaining_domains=plan.left_as_is,
+
+@mcp.tool()
+async def finish_redaction(
+    workbook: WorkbookUrl,
+    redacted_path: Annotated[
+        str, Field(description='The `redacted_path` that plan_redaction returned.')
+    ],
+    analysis_workbook: AnalysisWorkbookPath = None,
+    folder_id: Annotated[
+        str | None,
+        Field(
+            description='Drive folder or shared drive id to upload into. Defaults to the '
+            "user's My Drive."
+        ),
+    ] = None,
+) -> FinishResult:
+    """Verify the redacted copy, upload it to Drive, and record what was changed.
+
+    Call this after applying every write block from plan_redaction with the Excel MCP server.
+    It re-scans the local file first and refuses to publish if any domain that should have been
+    replaced is still there — a produced plan does not prove the writes landed, since another
+    server performs them.
+
+    This is the step that publishes, so it is the one to get approval for. On success every
+    rewritten cell is appended to the Redactions sheet of the analysis workbook. Check
+    `remaining_domains`: it should hold exactly the domains analyzed as not needing
+    anonymization.
+    """
+    drive = _drive()
+    staging = _staging()
+    analysis = _open_analysis(analysis_workbook)
+    staged = await stage_workbook(drive, staging, workbook)
+    hits = scan_path(staged.path, staged.info.file_id)
+    # Recomputed from the source, so the record reflects the same plan the writes came from.
+    plan = redaction.plan_redaction(staged, hits, analysis)
+
+    path = Path(redacted_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'{path} does not exist. Pass the redacted_path that plan_redaction returned, after '
+            'the Excel MCP server has written to it.'
         )
 
-    result = redaction.execute_redaction(backend, resolved, plan, analysis)
-    remaining = redaction.rescan_for_verification(
-        backend, backend.get_spreadsheet(parse_file_id(result.redacted_url))
-    )
-    return RedactionResult(
-        dry_run=False,
+    missed = redaction.verify(path, plan.mapped_domains)
+    if missed:
+        from .errors import RedactionNotApplied
+
+        raise RedactionNotApplied(str(path), missed)
+
+    uploaded = await drive.create(path.name, path.read_bytes(), parent_id=folder_id)
+    from .drive import file_url
+
+    redacted_url = file_url(uploaded.file_id) if uploaded.file_id else str(path)
+    records = redaction.record(plan, redacted_url, analysis)
+    remaining = unique_domains(scan_path(path, uploaded.file_id))
+
+    return FinishResult(
         source_workbook_url=plan.source_url,
-        redacted_workbook_url=result.redacted_url,
-        redacted_workbook_title=result.redacted_title,
+        redacted_workbook_url=redacted_url,
+        redacted_workbook_title=uploaded.name or path.name,
         cells_changed=plan.cells_to_change,
         domains_anonymized=plan.mapped_domains,
         domains_left_as_is=plan.left_as_is,
-        sample_changes=samples,
         remaining_domains=remaining,
+        redactions_recorded=len(records),
     )
 
 

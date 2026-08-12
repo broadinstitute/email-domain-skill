@@ -1,213 +1,141 @@
-"""In-memory stand-in for the Sheets and Drive APIs.
+"""In-memory stand-in for the Google Drive MCP connector.
 
-Models the behaviours the package actually depends on: A1 range writes that extend a sheet,
-appends that land after the last non-empty row, Drive copies that get fresh ids, and — because
-this is not guaranteed by Drive — sheet ids that change when a spreadsheet is copied.
+Much smaller than the Sheets fake it replaces, because cell semantics are no longer faked:
+workbooks are real `.xlsx` files built with openpyxl, so the tests exercise the same reader and
+writer that production uses. This only has to model Drive's file-level behaviour — ids, names,
+mime types, `modifiedTime`, and the fact that `create` always makes a *new* file, since the
+connector offers no update.
 """
 
 from __future__ import annotations
 
 import itertools
-import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from email_domain_scrubber.sheets import (
-    SPREADSHEET_MIME,
-    FileInfo,
-    SheetInfo,
-    SpreadsheetInfo,
-    ValueRange,
-)
-
-_RANGE = re.compile(
-    r"^(?:'(?P<quoted>(?:[^']|'')+)'|(?P<plain>[^!]+))"
-    r'(?:!(?P<col>[A-Z]+)(?P<row>\d+))?$'
-)
+from email_domain_scrubber import xlsx
+from email_domain_scrubber.drive import XLSX_MIME, FileInfo
+from email_domain_scrubber.errors import WorkbookNotFound
 
 
-def _parse_range(range_: str) -> tuple[str, int, int]:
-    """`'Sheet'!B7` -> (title, row0, col0). A bare sheet title anchors at A1."""
-    match = _RANGE.match(range_)
-    if not match:
-        raise ValueError(f'fake backend cannot parse range {range_!r}')
-    title = (
-        match.group('quoted').replace("''", "'")
-        if match.group('quoted') is not None
-        else match.group('plain')
-    )
-    if not match.group('col'):
-        return title, 0, 0
-    column = 0
-    for char in match.group('col'):
-        column = column * 26 + (ord(char) - ord('A') + 1)
-    return title, int(match.group('row')) - 1, column - 1
-
-
-@dataclass
-class FakeSheet:
-    sheet_id: int
-    title: str
-    values: list[list[str]] = field(default_factory=list)
-
-    def set(self, row: int, column: int, value: str) -> None:
-        while len(self.values) <= row:
-            self.values.append([])
-        line = self.values[row]
-        while len(line) <= column:
-            line.append('')
-        line[column] = value
-
-    def next_row(self) -> int:
-        for index in range(len(self.values) - 1, -1, -1):
-            if any(cell.strip() for cell in self.values[index]):
-                return index + 1
-        return 0
-
-    def copy(self, sheet_id: int) -> FakeSheet:
-        return FakeSheet(sheet_id, self.title, [list(row) for row in self.values])
+def write_xlsx(path: Path, sheets: dict[str, list[list[str]]]) -> Path:
+    """Build a real `.xlsx` on disk. The fixture workbook for most tests."""
+    xlsx.create(path, sheets)
+    return path
 
 
 @dataclass
 class FakeFile:
     file_id: str
     name: str
-    mime_type: str
+    content: bytes
+    mime_type: str = XLSX_MIME
+    modified_time: str = '2026-01-01T00:00:00Z'
     parents: tuple[str, ...] = ()
-    sheets: list[FakeSheet] = field(default_factory=list)
-    trashed: bool = False
 
     def info(self) -> FileInfo:
-        return FileInfo(self.file_id, self.name, self.mime_type, self.parents)
+        return FileInfo(
+            file_id=self.file_id,
+            name=self.name,
+            mime_type=self.mime_type,
+            modified_time=self.modified_time,
+            parents=self.parents,
+        )
 
 
-class FakeBackend:
-    """A `SheetsBackend` over dictionaries."""
+class FakeDrive:
+    """A `Drive` over a dictionary."""
 
     def __init__(self) -> None:
         self.files: dict[str, FakeFile] = {}
+        self.created: list[FakeFile] = []
+        self.downloads: list[str] = []
         self._ids = itertools.count(1)
-        self._sheet_ids = itertools.count(1000)
-        self.write_calls = 0
 
     # -- test helpers --------------------------------------------------------------------
-    def _new_id(self, prefix: str) -> str:
-        return f'{prefix}{next(self._ids):017d}'
+    def add_workbook(
+        self,
+        name: str,
+        sheets: dict[str, list[list[str]]],
+        tmp_path: Path,
+        *,
+        parent: str | None = None,
+    ) -> FakeFile:
+        """Register an `.xlsx` in fake Drive, built from `sheets`."""
+        source = write_xlsx(tmp_path / f'source-{next(self._ids)}.xlsx', sheets)
+        return self.add_bytes(name, source.read_bytes(), parent=parent)
 
-    def add_spreadsheet(
-        self, name: str, sheets: dict[str, list[list[str]]], parent: str | None = None
+    def add_bytes(
+        self, name: str, content: bytes, *, mime_type: str = XLSX_MIME, parent: str | None = None
     ) -> FakeFile:
         file = FakeFile(
-            file_id=self._new_id('sheet'),
+            file_id=f'file{next(self._ids):017d}',
             name=name,
-            mime_type=SPREADSHEET_MIME,
-            parents=(parent,) if parent else (),
-            sheets=[
-                FakeSheet(next(self._sheet_ids), title, [list(row) for row in rows])
-                for title, rows in sheets.items()
-            ],
-        )
-        self.files[file.file_id] = file
-        return file
-
-    def add_upload(self, name: str, mime_type: str, parent: str | None = None) -> FakeFile:
-        file = FakeFile(
-            file_id=self._new_id('upload'),
-            name=name,
+            content=content,
             mime_type=mime_type,
             parents=(parent,) if parent else (),
         )
         self.files[file.file_id] = file
         return file
 
-    def sheet_values(self, file_id: str, title: str) -> list[list[str]]:
-        return self._sheet(file_id, title).values
+    def touch(self, file_id: str, content: bytes, modified_time: str) -> None:
+        """Replace a file's bytes and bump its `modifiedTime`, as an editor would."""
+        file = self._file(file_id)
+        file.content = content
+        file.modified_time = modified_time
 
     def _file(self, file_id: str) -> FakeFile:
         try:
             return self.files[file_id]
         except KeyError:
-            raise LookupError(f'no such file: {file_id}') from None
+            raise WorkbookNotFound(f'no such file: {file_id}') from None
 
-    def _sheet(self, file_id: str, title: str) -> FakeSheet:
-        for sheet in self._file(file_id).sheets:
-            if sheet.title == title:
-                return sheet
-        raise LookupError(f'no such sheet {title!r} in {file_id}')
-
-    # -- SheetsBackend -------------------------------------------------------------------
-    def get_file(self, file_id: str) -> FileInfo:
+    # -- Drive ---------------------------------------------------------------------------
+    async def get_metadata(self, file_id: str) -> FileInfo:
         return self._file(file_id).info()
 
-    def find_file(self, name: str, parent_id: str | None) -> FileInfo | None:
-        for file in self.files.values():
-            if file.trashed or file.name != name:
-                continue
-            if parent_id and parent_id not in file.parents:
-                continue
-            return file.info()
-        return None
+    async def download(self, file_id: str) -> bytes:
+        self.downloads.append(file_id)
+        return self._file(file_id).content
 
-    def copy_file(self, file_id: str, name: str, *, to_spreadsheet: bool = False) -> FileInfo:
-        source = self._file(file_id)
-        sheets = source.sheets
-        if not sheets and to_spreadsheet:
-            # A converted upload: the fake has no cell data for uploads, so start with one sheet.
-            sheets = [FakeSheet(next(self._sheet_ids), 'Sheet1')]
-        copy = FakeFile(
-            file_id=self._new_id('copy'),
-            name=name,
-            mime_type=SPREADSHEET_MIME if to_spreadsheet else source.mime_type,
-            parents=source.parents,
-            # Fresh sheet ids: Drive does not promise to preserve them.
-            sheets=[sheet.copy(next(self._sheet_ids)) for sheet in sheets],
-        )
-        self.files[copy.file_id] = copy
-        return copy.info()
-
-    def move_to_folder(self, file_id: str, folder_id: str) -> FileInfo:
-        file = self._file(file_id)
-        file.parents = (folder_id,)
+    async def create(
+        self, name: str, content: bytes, *, mime_type: str = XLSX_MIME, parent_id: str | None = None
+    ) -> FileInfo:
+        file = self.add_bytes(name, content, mime_type=mime_type, parent=parent_id)
+        self.created.append(file)
         return file.info()
 
-    def get_spreadsheet(self, spreadsheet_id: str) -> SpreadsheetInfo:
-        file = self._file(spreadsheet_id)
-        return SpreadsheetInfo(
-            spreadsheet_id=file.file_id,
-            title=file.name,
-            sheets=tuple(SheetInfo(sheet.sheet_id, sheet.title) for sheet in file.sheets),
-        )
+    async def search(self, query: str, *, page_size: int = 10) -> list[FileInfo]:
+        return [file.info() for file in list(self.files.values())[:page_size]]
 
-    def create_spreadsheet(self, title: str, sheet_titles: list[str]) -> SpreadsheetInfo:
-        file = self.add_spreadsheet(title, {name: [] for name in sheet_titles})
-        return self.get_spreadsheet(file.file_id)
 
-    def add_sheets(self, spreadsheet_id: str, sheet_titles: list[str]) -> SpreadsheetInfo:
-        file = self._file(spreadsheet_id)
-        existing = {sheet.title for sheet in file.sheets}
-        for title in sheet_titles:
-            if title in existing:
-                raise ValueError(f'sheet {title!r} already exists')
-            file.sheets.append(FakeSheet(next(self._sheet_ids), title))
-        return self.get_spreadsheet(spreadsheet_id)
+@dataclass
+class Recorder:
+    """Captures what the Excel MCP server would have been asked to do.
 
-    def read_sheets(self, spreadsheet_id: str, sheet_titles: list[str]) -> list[ValueRange]:
-        return [
-            ValueRange(title, [list(row) for row in self._sheet(spreadsheet_id, title).values])
-            for title in sheet_titles
-        ]
+    Redaction writes are performed by an external server in production. Tests apply the same
+    blocks with openpyxl, which is what that server does internally, and keep the calls so a
+    test can assert on their shape.
+    """
 
-    def write_ranges(self, spreadsheet_id: str, updates: dict[str, list[list[str]]]) -> None:
-        self.write_calls += 1
-        for range_, values in updates.items():
-            title, row, column = _parse_range(range_)
-            sheet = self._sheet(spreadsheet_id, title)
-            for row_offset, line in enumerate(values):
-                for column_offset, value in enumerate(line):
-                    sheet.set(row + row_offset, column + column_offset, value)
+    calls: list[tuple[str, str, str, list[list[str]]]] = field(default_factory=list)
 
-    def append_rows(self, spreadsheet_id: str, sheet_title: str, rows: list[list[str]]) -> None:
-        sheet = self._sheet(spreadsheet_id, sheet_title)
-        start = sheet.next_row()
-        for row_offset, line in enumerate(rows):
-            for column_offset, value in enumerate(line):
-                sheet.set(start + row_offset, column_offset, value)
+    def apply(self, path: Path, blocks: list) -> None:
+        """Stand in for `write_data_to_excel`, one call per block."""
+        from openpyxl import load_workbook
+        from openpyxl.utils.cell import coordinate_to_tuple
+
+        for block in blocks:
+            self.calls.append((str(path), block.sheet, block.start_cell, block.values))
+            row, column = coordinate_to_tuple(block.start_cell)
+            workbook = load_workbook(path)
+            try:
+                worksheet = workbook[block.sheet]
+                for row_offset, values in enumerate(block.values):
+                    for column_offset, value in enumerate(values):
+                        worksheet.cell(
+                            row=row + row_offset, column=column + column_offset, value=value
+                        )
+                workbook.save(path)
+            finally:
+                workbook.close()
