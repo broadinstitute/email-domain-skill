@@ -79,24 +79,38 @@ Check it end to end:
 uv run email-domain-scrubber check-auth
 ```
 
-### Register the servers
+### Install as a plugin
 
-`.mcp.json` in this repo registers both for work inside this directory. For use elsewhere:
+This repo is its own Claude Code plugin marketplace. Installing the plugin registers the skill and
+both MCP servers for **every** project and session, not just this directory:
 
 ```bash
-claude mcp add email-domain-scrubber -- uv --directory /path/to/email-domain-skill run email-domain-scrubber
-claude mcp add excel -- uvx excel-mcp-server stdio
+claude plugin marketplace add broadinstitute/email-domain-skill
+claude plugin install email-domain-scrubber@broadinstitute-email-domain
 ```
+
+To develop against a local clone instead, point the marketplace at the working tree. The plugin
+then runs the code in place, so edits take effect on the next `/reload-plugins`:
+
+```bash
+claude plugin marketplace add /path/to/email-domain-skill
+claude plugin install email-domain-scrubber@broadinstitute-email-domain
+```
+
+Either way, `${CLAUDE_PLUGIN_ROOT}` resolves the `uv --directory` path, so there is no path to
+hand-edit. Verify with `claude plugin details email-domain-scrubber` (expect 1 skill, 2 MCP
+servers) and `claude mcp list` (expect both `plugin:email-domain-scrubber:*` entries connected).
+
+The plugin defaults `EMAIL_DOMAIN_RCLONE_REMOTE` to `aso`. Export a different value to override it;
+see [Authenticate](#authenticate).
 
 [`excel-mcp-server`](https://github.com/haris-musa/excel-mcp-server) needs no Microsoft Excel
 installation. Leave `EXCEL_FILES_PATH` unset so it accepts the absolute paths this server hands
 it.
 
-Install the skill globally (optional — it is already active in this repo):
-
-```bash
-ln -s "$PWD/.claude/skills/email-domain-risk-analysis" ~/.claude/skills/
-```
+`.mcp.json` at the repo root registers both servers for work inside this directory without the
+plugin. It is the same pair of servers, so with the plugin also enabled here they load twice under
+different names — harmless, but disable one if the duplicate tool lists get in the way.
 
 ### Optional settings
 
@@ -107,6 +121,9 @@ export EMAIL_DOMAIN_WORKDIR=~/.cache/email-domain-scrubber
 # The analysis workbook, if you want it somewhere else (e.g. in a git repo).
 export EMAIL_DOMAIN_ANALYSIS_WORKBOOK=~/metrics/email-domain-analysis.xlsx
 ```
+
+Both default under `$HOME` rather than the current directory, so the analysis record is one durable
+file no matter which project you invoke the skill from.
 
 ## Usage
 

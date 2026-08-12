@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "broadinstitute-email-domain",
+  "description": "The email domain privacy workflow for platform usage metric reports.",
+  "owner": {
+    "name": "Broad Institute",
+    "url": "https://github.com/broadinstitute/email-domain-skill"
+  },
+  "plugins": [
+    {
+      "name": "email-domain-scrubber",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
