@@ -1,7 +1,7 @@
 {
   "name": "email-domain-scrubber",
   "displayName": "Email Domain Scrubber",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Privacy risk analysis and anonymization of email domains in local Excel (.xlsx) usage metric reports. Ships the email-domain-risk-analysis skill plus the two MCP servers it drives: the scrubber (analysis record, redaction planning, verification) and excel-mcp-server (the cell writes).",
   "author": {
     "name": "Broad Institute",
@@ -9,7 +9,7 @@
   },
   "homepage": "https://github.com/broadinstitute/email-domain-skill#readme",
   "repository": "https://github.com/broadinstitute/email-domain-skill",
-  "keywords": ["privacy", "anonymization", "email-domains", "excel", "google-drive", "metrics"],
+  "keywords": ["privacy", "anonymization", "email-domains", "excel", "metrics"],
   "skills": "./.claude/skills/",
   "mcpServers": "./.claude-plugin/mcp.json"
 }

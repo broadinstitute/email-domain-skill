@@ -30,6 +30,12 @@ def test_open_creates_the_workbook_with_headers(tmp_path):
         assert xlsx.read_rows(path, name) == [HEADERS[name]]
 
 
+def test_the_schema_names_paths_not_urls():
+    """The record holds local paths; nothing in it refers to a remote location."""
+    assert HEADERS[WORKBOOKS] == ['Path', 'Title']
+    assert HEADERS[REDACTIONS][1:3] == ['SourcePath', 'RedactedPath']
+
+
 def test_open_is_idempotent_and_preserves_data(tmp_path):
     path = tmp_path / 'analysis.xlsx'
     first = AnalysisWorkbook.open(path)
@@ -60,14 +66,14 @@ def test_mismatched_headers_are_rejected(tmp_path):
         AnalysisWorkbook.open(path)
 
 
-def test_record_workbook_upserts_by_url(analysis):
-    analysis.record_workbook('https://drive.google.com/file/d/abc/view', 'Q1')
-    analysis.record_workbook('https://drive.google.com/file/d/abc/view', 'Q1 renamed')
-    analysis.record_workbook('https://drive.google.com/file/d/def/view', 'Q2')
+def test_record_workbook_upserts_by_path(analysis):
+    analysis.record_workbook('/reports/Q1.xlsx', 'Q1')
+    analysis.record_workbook('/reports/Q1.xlsx', 'Q1 renamed')
+    analysis.record_workbook('/reports/Q2.xlsx', 'Q2')
 
     assert analysis.scanned_workbooks() == {
-        'https://drive.google.com/file/d/abc/view': 'Q1 renamed',
-        'https://drive.google.com/file/d/def/view': 'Q2',
+        '/reports/Q1.xlsx': 'Q1 renamed',
+        '/reports/Q2.xlsx': 'Q2',
     }
 
 
@@ -197,7 +203,7 @@ def test_record_redactions_appends_rows(analysis):
 def test_writes_to_one_sheet_do_not_disturb_another(analysis):
     analysis.record_references([DomainReference('ref-a', 'lab.io', '2026-01-01')])
     analysis.store_analysis([('lab.io', 'High', 'a person', None)], random.Random(1))
-    analysis.record_workbook('https://drive.google.com/file/d/abc/view', 'Q1')
+    analysis.record_workbook('/reports/Q1.xlsx', 'Q1')
 
     assert analysis.reference_counts() == {'lab.io': 1}
     assert len(analysis.analysis_rows()) == 1

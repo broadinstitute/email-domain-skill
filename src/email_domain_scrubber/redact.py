@@ -1,8 +1,8 @@
 """Producing an anonymized copy of a metrics workbook.
 
-The source workbook is never modified, in Drive or on disk. Redaction copies the staged `.xlsx`,
-and the **Excel MCP server** writes the replacement values into that copy — this module only
-plans the writes and, afterwards, verifies that they landed.
+The source workbook on disk is never modified. Redaction copies it, and the **Excel MCP server**
+writes the replacement values into that copy — this module only plans the writes and, afterwards,
+verifies that they landed.
 
 Planning emits *blocks* rather than individual cells because `write_data_to_excel` takes a
 rectangle of rows at an offset. Edits are grouped into runs of consecutive rows within a single
@@ -19,6 +19,7 @@ from pathlib import Path
 
 from openpyxl.utils import get_column_letter
 
+from . import local
 from .domains import apply_redactions
 from .errors import UnanalyzedDomains
 from .scan import ScanHit, StagedWorkbook, scan_path
@@ -54,7 +55,7 @@ class WriteBlock:
 class RedactionPlan:
     """What redaction will do. Computing it touches no files."""
 
-    source_url: str
+    source_path: str
     source_title: str
     edits: list[CellEdit]
     blocks: list[WriteBlock]
@@ -92,8 +93,8 @@ def plan_redaction(
 
     edits = _plan_edits(hits, mapping)
     return RedactionPlan(
-        source_url=staged.url,
-        source_title=staged.info.name,
+        source_path=str(staged.path),
+        source_title=staged.title,
         edits=edits,
         blocks=coalesce(edits),
         mapped_domains=mapping,
@@ -107,7 +108,7 @@ def create_copy(staged: StagedWorkbook, staging: Staging) -> Path:
     A byte copy, so everything the source workbook contains survives up to the point where
     openpyxl rewrites it.
     """
-    destination = staging.anonymized_path(staged.info.file_id, staged.info.name)
+    destination = staging.anonymized_path(str(staged.path), staged.path.name)
     shutil.copy2(staged.path, destination)
     return destination
 
@@ -184,21 +185,20 @@ def verify(path: Path, mapping: dict[str, str]) -> list[str]:
     An external server does the writing now, so a produced plan no longer implies applied
     edits. This is what catches a write step that was skipped or only half ran.
     """
-    present = {hit.domain for hit in scan_path(path, file_id='')}
+    present = {hit.domain for hit in scan_path(path, source_url='')}
     return [domain for domain in mapping if domain in present]
 
 
 def record(
-    plan: RedactionPlan, redacted_url: str, analysis: AnalysisWorkbook
+    plan: RedactionPlan, redacted_path: Path, analysis: AnalysisWorkbook
 ) -> list[RedactionRecord]:
     """Append one Redactions row per (cell, domain) actually rewritten."""
-    from .drive import cell_reference
-
+    redacted_url = local.url(redacted_path)
     records = [
         RedactionRecord(
-            source_url=plan.source_url,
-            redacted_url=redacted_url,
-            reference=cell_reference(_id_from(redacted_url), edit.sheet_title, edit.a1),
+            source_path=plan.source_path,
+            redacted_path=str(redacted_path),
+            reference=local.cell_reference(redacted_url, edit.sheet_title, edit.a1),
             domain=domain,
             anonymized_domain=plan.mapped_domains[domain],
         )
@@ -207,17 +207,6 @@ def record(
     ]
     analysis.record_redactions(records)
     return records
-
-
-def _id_from(url: str) -> str:
-    """The Drive id inside a file URL, or the URL itself if it is not one."""
-    from .drive import parse_file_id
-    from .errors import InvalidWorkbookReference
-
-    try:
-        return parse_file_id(url)
-    except InvalidWorkbookReference:
-        return url
 
 
 __all__ = [

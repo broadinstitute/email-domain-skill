@@ -140,10 +140,10 @@ reports it describes.
 
 | Sheet | Columns | Contents |
 | --- | --- | --- |
-| `Workbooks` | `URL`, `Title` | Every metrics workbook scanned. |
+| `Workbooks` | `Path`, `Title` | Every metrics workbook scanned. |
 | `DomainReferences` | `DateExtracted`, `Reference`, `Domain` | One row per cell a domain was found in. Many rows per domain. |
 | `DomainAnalysis` | `Domain`, `Risk`, `Explanation`, `AnonymizedDomain` | Exactly one row per unique domain. |
-| `Redactions` | `DateRedacted`, `SourceURL`, `RedactedURL`, `Reference`, `Domain`, `AnonymizedDomain` | One row per cell actually rewritten. |
+| `Redactions` | `DateRedacted`, `SourcePath`, `RedactedPath`, `Reference`, `Domain`, `AnonymizedDomain` | One row per cell actually rewritten. |
 
 `Redactions` is what satisfies "keep separate records of anonymizations": `DomainAnalysis` holds
 the mapping and `DomainReferences` holds the source locations, but neither records what was
@@ -225,9 +225,9 @@ TLD. Metric reports are full of dotted tokens that are not domains — `Total.Co
 
 ```bash
 uv sync
-uv run pytest          # offline: real .xlsx files, no network
+uv run pytest          # real .xlsx files, no network at all
 uv run ruff check .
 uv run ruff format --check .
 ```
 
-See `AGENTS.md` for the architecture, the opt-in live test suite, and what is still unfinished.
+See `AGENTS.md` for the architecture and the analysis workbook schema.

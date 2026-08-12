@@ -7,16 +7,15 @@ Sheets, per AGENTS.md:
 * ``DomainAnalysis``   — exactly one row per unique domain, holding the skill's verdict
 * ``Redactions``       — one row per cell actually rewritten, satisfying the requirement to keep
   separate records of anonymizations (the mapping and the source locations live in the two
-  sheets above; this records what was published, where, and when)
+  sheets above; this records what was produced, where, and when)
 
 The skill owns ``Risk`` and ``Explanation``. This module owns ``AnonymizedDomain``: it mints a
 token when analysis says a domain needs one and never changes a token that already exists, so
 tokens stay stable across quarters.
 
-It is a **local** `.xlsx`. The Drive MCP connector can create files but not update them, so a
-Drive-hosted record could only ever be rewritten as a new file per edit. Being local also means
-the whole sheet can be loaded, mutated, and saved, which is why none of the row-number tracking
-and cache invalidation the Sheets API needed survives here.
+It is a plain local `.xlsx`, so the whole sheet is loaded, mutated, and saved on every write —
+no row-number tracking, no cache to invalidate. Being a plain file, it can also live in a git
+repo alongside the reports it describes.
 """
 
 from __future__ import annotations
@@ -35,13 +34,13 @@ DOMAIN_ANALYSIS = 'DomainAnalysis'
 REDACTIONS = 'Redactions'
 
 HEADERS: dict[str, list[str]] = {
-    WORKBOOKS: ['URL', 'Title'],
+    WORKBOOKS: ['Path', 'Title'],
     DOMAIN_REFERENCES: ['DateExtracted', 'Reference', 'Domain'],
     DOMAIN_ANALYSIS: ['Domain', 'Risk', 'Explanation', 'AnonymizedDomain'],
     REDACTIONS: [
         'DateRedacted',
-        'SourceURL',
-        'RedactedURL',
+        'SourcePath',
+        'RedactedPath',
         'Reference',
         'Domain',
         'AnonymizedDomain',
@@ -91,8 +90,8 @@ class AnalysisRow:
 
 @dataclass(frozen=True)
 class RedactionRecord:
-    source_url: str
-    redacted_url: str
+    source_path: str
+    redacted_path: str
     reference: str
     domain: str
     anonymized_domain: str
@@ -114,8 +113,7 @@ class AnalysisWorkbook:
     def open(cls, path: Path) -> AnalysisWorkbook:
         """Open the workbook, creating it if it does not exist yet.
 
-        Creating on demand is safe now that the record is a local file: there is no Drive
-        clutter to worry about, and it removes a setup step from the skill's workflow.
+        Creating on demand removes a setup step from the skill's workflow.
         """
         workbook = cls(path)
         if not path.exists():
@@ -124,8 +122,8 @@ class AnalysisWorkbook:
         return workbook
 
     @property
-    def url(self) -> str:
-        """How the record is referred to in tool output. A path, now that it is local."""
+    def location(self) -> str:
+        """How the record is referred to in tool output."""
         return str(self.path)
 
     @property
@@ -214,7 +212,7 @@ class AnalysisWorkbook:
         ]
 
     def scanned_workbooks(self) -> dict[str, str]:
-        """Workbook URL -> recorded title."""
+        """Workbook path -> recorded title."""
         return {_cell(row, 0): _cell(row, 1) for row in self._data_rows(WORKBOOKS) if _cell(row, 0)}
 
     # -- writes --------------------------------------------------------------------------
@@ -225,10 +223,10 @@ class AnalysisWorkbook:
         if rows:
             self._write(sheet_title, [*self._data_rows(sheet_title), *rows])
 
-    def record_workbook(self, url: str, title: str) -> None:
-        """Upsert a scanned workbook by URL, keeping its title current."""
+    def record_workbook(self, path: str, title: str) -> None:
+        """Upsert a scanned workbook by path, keeping its title current."""
         existing = self.scanned_workbooks()
-        existing[url] = title
+        existing[path] = title
         self._write(WORKBOOKS, [[key, value] for key, value in existing.items()])
 
     def record_references(self, references: list[DomainReference]) -> list[DomainReference]:
@@ -300,8 +298,8 @@ class AnalysisWorkbook:
             [
                 [
                     record.date_redacted,
-                    record.source_url,
-                    record.redacted_url,
+                    record.source_path,
+                    record.redacted_path,
                     record.reference,
                     record.domain,
                     record.anonymized_domain,
