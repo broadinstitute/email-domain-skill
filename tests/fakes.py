@@ -31,7 +31,7 @@ class FakeFile:
     content: bytes
     mime_type: str = XLSX_MIME
     modified_time: str = '2026-01-01T00:00:00Z'
-    parents: tuple[str, ...] = ()
+    parent_id: str = ''
 
     def info(self) -> FileInfo:
         return FileInfo(
@@ -39,7 +39,7 @@ class FakeFile:
             name=self.name,
             mime_type=self.mime_type,
             modified_time=self.modified_time,
-            parents=self.parents,
+            parent_id=self.parent_id,
         )
 
 
@@ -73,7 +73,7 @@ class FakeDrive:
             name=name,
             content=content,
             mime_type=mime_type,
-            parents=(parent,) if parent else (),
+            parent_id=parent or '',
         )
         self.files[file.file_id] = file
         return file

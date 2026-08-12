@@ -224,6 +224,9 @@ TLD. Metric reports are full of dotted tokens that are not domains — `Total.Co
 - **Redaction loses charts, pivot tables, and images.** The copy is byte-identical until the
   Excel MCP server opens it, and that round-trips through openpyxl, which does not preserve them.
   Cell values, formulas elsewhere in the workbook, and most formatting survive.
+- **Pass `folder_id` to `finish_redaction`.** With no parent specified the connector picks one
+  itself, and it has been observed putting the file in a shared drive root rather than My Drive.
+  If where the report lands matters, say so explicitly.
 - **`Reference` is not a cell deep link.** A Google Sheet could be linked with `#gid=…&range=…`;
   an `.xlsx` in Drive cannot. The format is
   `https://drive.google.com/file/d/<id>/view#<Sheet>!<A1>` — it opens the file, and the fragment
@@ -249,5 +252,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-Live teardown goes through rclone, since the connector cannot delete. Files are named
-`zz-scrubber-test-*`; if cleanup cannot run it says so and names the prefix to search for.
+Live teardown deletes by file id through the Drive REST API, since the connector has no delete
+and `create_file` may place files in a shared drive where a name-based sweep would miss them.
+Scratch files are named `zz-scrubber-test-*`; anything that could not be removed is listed at the
+end of the run.

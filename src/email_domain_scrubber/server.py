@@ -361,8 +361,10 @@ async def finish_redaction(
     folder_id: Annotated[
         str | None,
         Field(
-            description='Drive folder or shared drive id to upload into. Defaults to the '
-            "user's My Drive."
+            description='Drive folder or shared drive id to upload into. Strongly recommended: '
+            'left unset, the connector chooses the parent itself, and it has been observed to '
+            'place the file in a shared drive rather than My Drive. Pass this to control where '
+            'the anonymized report is published.'
         ),
     ] = None,
 ) -> FinishResult:

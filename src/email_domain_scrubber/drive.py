@@ -11,12 +11,17 @@ The connector's surface is deliberately small and read-mostly — `search_files`
 move**, which is why redaction always creates a new file and why the analysis workbook is kept
 locally rather than in Drive.
 
-Two protocol quirks, both confirmed against the live endpoint:
+Behaviours confirmed against the live endpoint, none of which the documentation states:
 
 * Errors arrive as HTTP 403 with a *valid* JSON-RPC body, so the body must be read on non-2xx
   rather than treated as a transport failure.
-* A failed tool call is reported as ``result.isError`` with the message in text content, not as
-  a JSON-RPC error, so success has to be checked per call rather than per response.
+* A failed tool call is reported as ``is_error`` with the message in text content, not as a
+  JSON-RPC error — and sometimes as bare prose with no error flag at all, so any non-JSON
+  response has to be treated as a failure message.
+* File objects use Drive's *v2*-style field names, not the v3 names the REST API uses: a file's
+  name is ``title`` and its parent is a single ``parentId``, not a ``parents`` array.
+* ``download_file_content`` returns the base64 under ``content``, while ``create_file`` *accepts*
+  it as ``base64Content``. The two are not symmetric.
 """
 
 from __future__ import annotations
@@ -80,11 +85,18 @@ def cell_reference(file_id: str, sheet_title: str, a1: str) -> str:
 
 @dataclass(frozen=True)
 class FileInfo:
+    """A Drive file as the connector describes it.
+
+    Field names are those the live connector actually returns, which differ from the Drive REST
+    API's: the file's name arrives as ``title``, and its parent as a single ``parentId`` rather
+    than a ``parents`` array.
+    """
+
     file_id: str
     name: str
     mime_type: str
     modified_time: str = ''
-    parents: tuple[str, ...] = ()
+    parent_id: str = ''
 
     @property
     def is_xlsx(self) -> bool:
@@ -170,11 +182,12 @@ class DriveMcpClient:
             result = await client.call_tool(tool, arguments)
 
         text = _first_text(result.content)
-        if getattr(result, 'isError', False):
+        # snake_case: `isError`/`structuredContent` are the wire aliases, and reading those off
+        # the model silently yields None — so an error result would sail through as a success.
+        if result.is_error:
             raise _classify(tool, text or 'no detail given')
-        structured = getattr(result, 'structuredContent', None)
-        if isinstance(structured, dict):
-            return structured
+        if isinstance(result.structured_content, dict):
+            return result.structured_content
         # A successful call always answers with JSON. The connector has been seen to report a
         # refusal as plain prose *without* setting isError, so unparseable text is a failure
         # message, not a malformed success — classify it rather than complaining about the shape.
@@ -189,7 +202,9 @@ class DriveMcpClient:
 
     async def download(self, file_id: str) -> bytes:
         payload = await self._call('download_file_content', {'fileId': file_id})
-        encoded = _pick(payload, 'base64Content', 'content', 'data', 'fileContent')
+        # `content` is what the connector returns, confirmed live. Note the asymmetry with
+        # `create_file`, whose *input* field is `base64Content` and whose `content` is deprecated.
+        encoded = _pick(payload, 'content', 'base64Content', 'data', 'fileContent')
         if not encoded:
             raise DriveMcpError('download_file_content', f'no content returned for {file_id}')
         try:
@@ -252,13 +267,11 @@ def _pick(payload: dict[str, Any], *keys: str) -> str:
 
 
 def _file_info(payload: dict[str, Any], *, fallback_id: str) -> FileInfo:
-    parents = payload.get('parents') or (payload.get('file') or {}).get('parents') or ()
-    if isinstance(parents, str):
-        parents = (parents,)
+    """Read a File object. `title` and `parentId` are what the connector really sends."""
     return FileInfo(
         file_id=_pick(payload, 'id', 'fileId') or fallback_id,
-        name=_pick(payload, 'name', 'title'),
+        name=_pick(payload, 'title', 'name'),
         mime_type=_pick(payload, 'mimeType', 'contentMimeType'),
         modified_time=_pick(payload, 'modifiedTime', 'modifiedAt'),
-        parents=tuple(str(parent) for parent in parents),
+        parent_id=_pick(payload, 'parentId', 'parent'),
     )

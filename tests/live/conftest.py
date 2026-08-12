@@ -10,25 +10,27 @@ The second point matters because the code under test creates files of its own �
 `(anonymized)` copy of a metrics workbook — and a test that fails halfway never gets to register
 them. Sweeping by name leaves nothing behind either way.
 
-Cleanup goes through **rclone**, not the connector: the Drive MCP connector can create and copy
-files but offers no delete, trash, or update. rclone is already required as the credential
-source, so this adds no new dependency — but if the binary is missing, teardown says exactly
-what was left behind rather than failing silently.
+Cleanup cannot go through the connector, which offers no delete, trash, or update — so teardown
+deletes by file id through the Drive REST API, using the same token. Deleting by id rather than
+by name matters: `create_file` chooses its own parent when none is given, and has been seen to
+put files in a shared drive root, where a name-based sweep of My Drive would never find them.
+This is the one place the Drive REST API appears, and only to undo what the tests did.
 """
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from email_domain_scrubber import auth, xlsx
+from email_domain_scrubber import xlsx
+from email_domain_scrubber.auth import TokenSource
 from email_domain_scrubber.drive import DriveMcpClient, FileInfo
 from email_domain_scrubber.errors import ScrubberError
+
+DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files'
 
 #: Every scratch file starts with this, so the sweep can find them and a human scanning their
 #: Drive can tell at a glance what these are.
@@ -74,25 +76,38 @@ class Scratch:
         return info
 
     def sweep(self) -> None:
-        """Delete every file whose name starts with this run's prefix."""
-        remote = auth.configured_remote()
-        if not shutil.which('rclone'):
-            self._warn('rclone is not on PATH')
-            return
-        result = subprocess.run(
-            ['rclone', 'delete', f'{remote}:', '--include', f'{self.prefix}*', '--drive-use-trash'],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            self._warn(f'rclone delete failed: {result.stderr.strip()}')
+        """Delete every file this run created, by id."""
+        import asyncio
 
-    def _warn(self, reason: str) -> None:
-        print(
-            f'\nWARNING: could not clean up live test files ({reason}).\n'
-            f'  Remove them by searching Drive for: {self.prefix}'
-        )
+        leftover = asyncio.run(self._delete_all())
+        if leftover:
+            print(
+                f'\nWARNING: could not delete {len(leftover)} live test file(s):\n'
+                + '\n'.join(f'  {name} ({reason})' for name, reason in leftover)
+                + f'\n  Remove them by searching Drive for: {self.prefix}'
+            )
+
+    async def _delete_all(self) -> list[tuple[str, str]]:
+        import httpx2
+
+        token = await TokenSource().token()
+        failures: list[tuple[str, str]] = []
+        async with httpx2.AsyncClient(
+            timeout=60, headers={'Authorization': f'Bearer {token}'}
+        ) as http:
+            for info in self.created:
+                if not info.file_id:
+                    continue
+                try:
+                    response = await http.delete(
+                        f'{DRIVE_FILES}/{info.file_id}', params={'supportsAllDrives': 'true'}
+                    )
+                except Exception as exc:  # noqa: BLE001 - never mask the test's own failure
+                    failures.append((info.name, str(exc)))
+                    continue
+                if response.status_code not in (200, 204, 404):
+                    failures.append((info.name, f'HTTP {response.status_code}'))
+        return failures
 
 
 @pytest.fixture

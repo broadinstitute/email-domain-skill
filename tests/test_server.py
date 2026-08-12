@@ -361,4 +361,4 @@ def test_finish_uploads_into_the_requested_folder(drive, metrics, book, excel):
 
     run(server.finish_redaction(metrics.file_id, plan.redacted_path, book, folder_id='shared1'))
 
-    assert drive.created[-1].parents == ('shared1',)
+    assert drive.created[-1].parent_id == 'shared1'
