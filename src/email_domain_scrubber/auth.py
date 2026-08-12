@@ -1,10 +1,14 @@
 """OAuth access tokens for the Google Drive MCP connector.
 
 Credentials come from an **rclone** Google Drive remote, named by
-`EMAIL_DOMAIN_RCLONE_REMOTE`. rclone already holds a Drive OAuth client and refresh token, and
-its full `drive` scope is a superset of the two scopes the connector asks for
-(`drive.readonly` and `drive.file`). The config is only ever read; refreshed access tokens are
-kept in memory, not written back.
+`EMAIL_DOMAIN_RCLONE_REMOTE`. rclone already holds a Drive OAuth client and refresh token. The
+config is only ever read; refreshed access tokens are kept in memory, not written back.
+
+The connector wants the literal scopes `drive.readonly` and `drive.file`, and it checks for those
+strings rather than for equivalent authority. A token carrying only the full `drive` scope — a
+strict superset in capability, and rclone's default — is refused with "The caller does not have
+permission". This was confirmed against the live endpoint, so the check below insists on both.
+rclone's `scope` takes a comma-separated list, which is how you grant them.
 
 The server acts as the signed-in user, so it can only reach files that user can already open.
 
@@ -30,6 +34,10 @@ RCLONE_REMOTE_ENV = 'EMAIL_DOMAIN_RCLONE_REMOTE'
 CLIENT_ID_ENV = 'EMAIL_DOMAIN_OAUTH_CLIENT_ID'
 CLIENT_SECRET_ENV = 'EMAIL_DOMAIN_OAUTH_CLIENT_SECRET'
 
+#: The scopes the connector requires by name. `drive.readonly` to read reports, `drive.file` to
+#: upload redacted copies. It will not accept the broader `drive` scope in their place.
+CONNECTOR_SCOPES = ('drive.readonly', 'drive.file')
+
 TOKEN_URI = 'https://oauth2.googleapis.com/token'
 
 #: Refresh this many seconds before the token actually expires, so a call that starts just
@@ -52,7 +60,8 @@ def configured_remote() -> str:
     if not remote:
         raise ScrubberError(
             f'No Google credentials configured. Set {RCLONE_REMOTE_ENV} to the name of an rclone '
-            'remote with `type = drive` and `scope = drive`, for example:\n'
+            f'remote with `type = drive` and `scope = drive,{",".join(CONNECTOR_SCOPES)}`, '
+            'for example:\n'
             f'  export {RCLONE_REMOTE_ENV}=aso'
         )
     return remote
@@ -107,12 +116,19 @@ def oauth_client(remote: str | None = None, config_path: Path | None = None) -> 
             'Drive remote.'
         )
 
-    scope = section.get('scope', 'drive').strip() or 'drive'
-    if scope not in ('drive', 'drive.file'):
+    granted = {
+        part.strip() for part in (section.get('scope') or 'drive').split(',') if part.strip()
+    }
+    missing = [scope for scope in CONNECTOR_SCOPES if scope not in granted]
+    if missing:
         raise RcloneConfigError(
-            f'rclone remote {remote!r} was authorized with scope {scope!r}. The Drive MCP '
-            'connector needs "drive" (or at least "drive.file") to read reports and upload '
-            'redacted copies; re-run `rclone config` for that remote.'
+            f'rclone remote {remote!r} was authorized with scope '
+            f'{",".join(sorted(granted)) or "drive"!r}, which is missing '
+            f'{" and ".join(missing)}. The Drive MCP connector checks for those exact scope '
+            'names and refuses a token that only carries the broader "drive" scope, even though '
+            'it grants strictly more. Set both on the remote and re-consent:\n'
+            f'  rclone config update {remote} scope drive,{",".join(CONNECTOR_SCOPES)}\n'
+            f'  rclone config reconnect {remote}:'
         )
 
     # An explicit client wins: the connector is billed to the Cloud project owning the client,

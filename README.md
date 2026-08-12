@@ -46,13 +46,19 @@ link. `check-auth` below reports it directly.
 ### Authenticate
 
 Credentials come from an existing rclone Google Drive remote. rclone already holds a Drive OAuth
-client and refresh token, and its full `drive` scope covers both scopes the connector asks for
-(`drive.readonly` and `drive.file`). The config is only ever read; refreshed access tokens stay
-in memory and are never written back. The server acts as the signed-in user, so it can only reach
-files that user can already open.
+client and refresh token. The config is only ever read; refreshed access tokens stay in memory and
+are never written back. The server acts as the signed-in user, so it can only reach files that
+user can already open.
+
+**The connector requires the scopes `drive.readonly` and `drive.file` by name.** It checks for
+those exact strings, not for equivalent authority, so rclone's default full `drive` scope — a
+strict superset — is refused with `The caller does not have permission`. rclone's `scope` takes a
+comma-separated list, so grant all three and re-consent:
 
 ```bash
-export EMAIL_DOMAIN_RCLONE_REMOTE=aso    # a remote with `type = drive` and `scope = drive`
+rclone config update aso scope drive,drive.readonly,drive.file
+rclone config reconnect aso:          # opens a browser
+export EMAIL_DOMAIN_RCLONE_REMOTE=aso
 ```
 
 The remote needs its own `client_id`/`client_secret` — with rclone's built-in OAuth client the

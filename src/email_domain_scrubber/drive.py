@@ -24,6 +24,8 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -146,25 +148,40 @@ class DriveMcpClient:
         self._endpoint = endpoint
         self._tokens = tokens or TokenSource()
 
-    async def _call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    @asynccontextmanager
+    async def _session(self, timeout: float) -> AsyncIterator[Any]:
+        """A connected MCP client, authorized as the signed-in user."""
         import httpx2
         from mcp import Client
-        from mcp.client.streamable_http import StreamableHTTPTransport
+        from mcp.client.streamable_http import streamable_http_client
 
         token = await self._tokens.token()
         async with httpx2.AsyncClient(
-            timeout=120, headers={'Authorization': f'Bearer {token}'}
+            timeout=timeout, headers={'Authorization': f'Bearer {token}'}
         ) as http:
-            transport = StreamableHTTPTransport(self._endpoint, http_client=http)
-            async with Client(transport) as client:
-                result = await client.call_tool(tool, arguments)
+            # Pass the transport unentered: Client enters it, and entering it here would hand
+            # Client a plain stream tuple instead of the context manager it expects.
+            transport = streamable_http_client(self._endpoint, http_client=http)
+            async with Client(transport, raise_exceptions=True) as client:
+                yield client
 
+    async def _call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        async with self._session(timeout=120) as client:
+            result = await client.call_tool(tool, arguments)
+
+        text = _first_text(result.content)
         if getattr(result, 'isError', False):
-            raise _classify(tool, _first_text(result.content) or 'no detail given')
+            raise _classify(tool, text or 'no detail given')
         structured = getattr(result, 'structuredContent', None)
         if isinstance(structured, dict):
             return structured
-        return _parse_json(_first_text(result.content), tool)
+        # A successful call always answers with JSON. The connector has been seen to report a
+        # refusal as plain prose *without* setting isError, so unparseable text is a failure
+        # message, not a malformed success — classify it rather than complaining about the shape.
+        payload = _parse_json(text, tool)
+        if payload is None:
+            raise _classify(tool, text or 'empty response')
+        return payload
 
     async def get_metadata(self, file_id: str) -> FileInfo:
         payload = await self._call('get_file_metadata', {'fileId': file_id})
@@ -204,29 +221,21 @@ class DriveMcpClient:
 
     async def list_tools(self) -> list[str]:
         """Tool names the connector advertises. Used by `check-auth` to prove reachability."""
-        import httpx2
-        from mcp import Client
-        from mcp.client.streamable_http import StreamableHTTPTransport
-
-        token = await self._tokens.token()
-        async with httpx2.AsyncClient(
-            timeout=60, headers={'Authorization': f'Bearer {token}'}
-        ) as http:
-            transport = StreamableHTTPTransport(self._endpoint, http_client=http)
-            async with Client(transport) as client:
-                listed = await client.list_tools()
+        async with self._session(timeout=60) as client:
+            listed = await client.list_tools()
         return sorted(tool.name for tool in listed.tools)
 
 
-def _parse_json(text: str, tool: str) -> dict[str, Any]:
+def _parse_json(text: str, tool: str) -> dict[str, Any] | None:
+    """The response as a mapping, or `None` if it is not JSON at all."""
     import json
 
     if not text:
-        return {}
+        return None
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise DriveMcpError(tool, f'unparseable response: {text[:200]}') from exc
+    except json.JSONDecodeError:
+        return None
     return parsed if isinstance(parsed, dict) else {'value': parsed}
 
 

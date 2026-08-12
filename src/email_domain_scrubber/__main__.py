@@ -15,11 +15,20 @@ import sys
 from .errors import ScrubberError
 
 
-async def _check() -> tuple[str, list[str]]:
-    from .auth import credential_source
-    from .drive import DriveMcpClient
+async def _check() -> tuple[str, list[str], int]:
+    """Prove the connector both answers and *works*.
 
-    return credential_source(), await DriveMcpClient().list_tools()
+    Listing tools is not enough: the endpoint answers `tools/list` even when the Drive MCP API is
+    disabled for the OAuth client's project, so a check that stopped there would report a false
+    green and leave the real failure for the first scan. A harmless read is the only proof.
+    """
+    from .auth import credential_source
+    from .drive import XLSX_MIME, DriveMcpClient
+
+    client = DriveMcpClient()
+    tools = await client.list_tools()
+    found = await client.search(f"mimeType = '{XLSX_MIME}'", page_size=1)
+    return credential_source(), tools, len(found)
 
 
 def check_auth() -> int:
@@ -28,13 +37,14 @@ def check_auth() -> int:
     from .staging import analysis_workbook_path, workdir
 
     try:
-        source, tools = asyncio.run(_check())
+        source, tools, found = asyncio.run(_check())
     except ScrubberError as exc:
         print(f'Google Drive MCP access is NOT working.\n\n{exc}', file=sys.stderr)
         return 1
 
     print(f'Credential source:  {source}')
     print(f'Drive MCP endpoint: OK, {len(tools)} tools: {", ".join(tools)}')
+    print(f'Test search:        OK, {found} .xlsx file(s) visible')
     print(f'Work directory:     {workdir()}')
     print(f'Analysis workbook:  {analysis_workbook_path()}')
     print(

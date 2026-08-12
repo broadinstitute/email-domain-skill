@@ -14,7 +14,7 @@ REFRESH_TOKEN = 'refresh-abc'
 def write_config(tmp_path, **overrides):
     section = {
         'type': 'drive',
-        'scope': 'drive',
+        'scope': 'drive,drive.readonly,drive.file',
         'client_id': 'client-123',
         'client_secret': 'secret-456',
         'token': json.dumps({'access_token': 'stale', 'refresh_token': REFRESH_TOKEN}),
@@ -72,18 +72,40 @@ def test_a_non_drive_remote_is_rejected(tmp_path):
         auth.oauth_client('aso', write_config(tmp_path, type='s3'))
 
 
-def test_a_narrow_scope_is_rejected(tmp_path):
+def test_the_connectors_scopes_are_accepted(tmp_path):
+    config = write_config(tmp_path, scope='drive,drive.readonly,drive.file')
+    assert auth.oauth_client('aso', config)
+
+
+def test_the_connectors_scopes_alone_are_enough(tmp_path):
+    config = write_config(tmp_path, scope='drive.readonly,drive.file')
+    assert auth.oauth_client('aso', config)
+
+
+def test_scope_lists_tolerate_whitespace(tmp_path):
+    config = write_config(tmp_path, scope=' drive.readonly , drive.file ')
+    assert auth.oauth_client('aso', config)
+
+
+def test_the_broad_drive_scope_alone_is_rejected(tmp_path):
+    """Verified against the live connector: it wants the exact names, not equivalent authority."""
+    with pytest.raises(RcloneConfigError) as caught:
+        auth.oauth_client('aso', write_config(tmp_path, scope='drive'))
+
+    message = str(caught.value)
+    assert 'drive.readonly' in message and 'drive.file' in message
+    assert 'rclone config reconnect aso:' in message
+
+
+def test_an_absent_scope_is_rejected_like_the_default(tmp_path):
+    """rclone's default is plain `drive`, so saying nothing is the same failing configuration."""
     with pytest.raises(RcloneConfigError, match='drive.readonly'):
-        auth.oauth_client('aso', write_config(tmp_path, scope='drive.readonly'))
+        auth.oauth_client('aso', write_config(tmp_path, scope=None))
 
 
-def test_drive_file_scope_is_accepted(tmp_path):
-    """Enough to read the reports it created and to upload redacted copies."""
-    assert auth.oauth_client('aso', write_config(tmp_path, scope='drive.file'))
-
-
-def test_an_absent_scope_defaults_to_drive(tmp_path):
-    assert auth.oauth_client('aso', write_config(tmp_path, scope=None))
+def test_a_partial_scope_list_names_what_is_missing(tmp_path):
+    with pytest.raises(RcloneConfigError, match='missing drive.file'):
+        auth.oauth_client('aso', write_config(tmp_path, scope='drive,drive.readonly'))
 
 
 def test_rclones_builtin_client_is_rejected(tmp_path):
