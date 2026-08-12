@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 from .errors import (
     AccessDenied,
+    CredentialsExpired,
     InvalidWorkbookReference,
     MissingScopes,
     ScrubberError,
@@ -156,11 +157,18 @@ def _execute(request: Any) -> Any:
     the client library rather than being told how to fix it — and a missing scope is the single
     most likely first-run failure.
     """
+    from google.auth.exceptions import RefreshError
     from googleapiclient.errors import HttpError
 
     for attempt in range(_RETRY_ATTEMPTS):
         try:
             return request.execute()
+        except RefreshError as exc:
+            # google-auth refreshes lazily, inside the first call that needs a token, so a
+            # revoked or expired refresh token arrives here rather than at credential build time.
+            from .auth import login_hint
+
+            raise CredentialsExpired(str(exc), login_hint()) from exc
         except HttpError as exc:
             status = getattr(exc.resp, 'status', None)
             if status in _RETRY_STATUSES and attempt < _RETRY_ATTEMPTS - 1:
@@ -171,7 +179,13 @@ def _execute(request: Any) -> Any:
 
 
 def _translate(exc: Any, status: int | None) -> Exception:
+    from .auth import login_hint
+
     detail = str(getattr(exc, 'reason', '') or exc)
+    if status == 401:
+        # A token that google-auth thought was fine but Google rejected: same fix as a failed
+        # refresh, so give the same instruction.
+        return CredentialsExpired(detail, login_hint())
     if status == 403:
         # Google reports `insufficientPermissions` for a missing scope *and* for a file the user
         # cannot reach, so only the message distinguishes them.

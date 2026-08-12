@@ -34,6 +34,21 @@ class RcloneConfigError(ScrubberError):
     """The rclone remote named for credentials is missing or unusable."""
 
 
+class CredentialsExpired(ScrubberError):
+    """Credentials were found but Google would not renew them.
+
+    A refresh token is revoked when the user changes their password, an admin revokes the grant,
+    or (for an app in testing) after seven days. Google says only `invalid_grant: Bad Request`,
+    so the fix — signing in again, in a browser — has to be spelled out here.
+    """
+
+    def __init__(self, detail: str, login: str) -> None:
+        super().__init__(
+            f'Google would not renew the stored credentials ({detail}). They have expired or been '
+            f'revoked, so you need to sign in again:\n  {login}'
+        )
+
+
 class AccessDenied(ScrubberError):
     """The signed-in user cannot reach or modify the file."""
 
