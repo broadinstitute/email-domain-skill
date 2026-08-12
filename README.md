@@ -101,8 +101,10 @@ claude plugin marketplace add /path/to/email-domain-skill
 claude plugin install email-domain-scrubber@broadinstitute-email-domain
 ```
 
-Either way, `${CLAUDE_PLUGIN_ROOT}` resolves the `uv --directory` path, so there is no path to
-hand-edit. Verify with `claude plugin details email-domain-scrubber` (expect 1 skill, 2 MCP
+Either way, `${CLAUDE_PLUGIN_ROOT}` resolves the `uv --project` path, so there is no path to
+hand-edit. It is `--project` rather than `--directory` on purpose: `--directory` would change the
+server's working directory to the plugin, and relative workbook paths would resolve against the
+wrong place. Verify with `claude plugin details email-domain-scrubber` (expect 1 skill, 2 MCP
 servers) and `claude mcp list` (expect both `plugin:email-domain-scrubber:*` entries connected).
 
 The plugin defaults `EMAIL_DOMAIN_RCLONE_REMOTE` to `aso`. Export a different value to override it;
