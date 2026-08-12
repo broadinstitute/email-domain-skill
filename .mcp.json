@@ -4,6 +4,11 @@
       "command": "uv",
       "args": ["run", "--frozen", "email-domain-scrubber"],
       "env": {}
+    },
+    "excel": {
+      "command": "uvx",
+      "args": ["excel-mcp-server", "stdio"],
+      "env": {}
     }
   }
 }

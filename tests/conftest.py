@@ -1,10 +1,12 @@
 import os
+from pathlib import Path
 
 import pytest
 
+from email_domain_scrubber.staging import ANALYSIS_WORKBOOK_ENV, WORKDIR_ENV, Staging
 from email_domain_scrubber.workbook import AnalysisWorkbook
 
-from .fakes import FakeBackend
+from .fakes import FakeDrive, Recorder
 
 #: Alternative to `--live`, for running the live tests from an editor or CI job that cannot
 #: easily pass extra pytest arguments.
@@ -16,14 +18,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         '--live',
         action='store_true',
         default=False,
-        help='Run the tests that talk to real Google Sheets and Drive. Needs credentials; '
-        'creates and trashes scratch files in the signed-in user\'s My Drive.',
+        help='Run the tests that talk to the real Google Drive MCP connector. Needs credentials; '
+        "creates scratch files in the signed-in user's My Drive.",
     )
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
-        'markers', 'live: talks to real Google; needs credentials and --live to run'
+        'markers', 'live: talks to the real Drive MCP connector; needs credentials and --live'
     )
 
 
@@ -35,17 +37,36 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     """
     if config.getoption('--live') or os.environ.get(LIVE_ENV) == '1':
         return
-    skip = pytest.mark.skip(reason=f'live Google test; run with --live or {LIVE_ENV}=1')
+    skip = pytest.mark.skip(reason=f'live Drive MCP test; run with --live or {LIVE_ENV}=1')
     for item in items:
         if 'live' in item.keywords:
             item.add_marker(skip)
 
 
-@pytest.fixture
-def backend() -> FakeBackend:
-    return FakeBackend()
+@pytest.fixture(autouse=True)
+def _isolate_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test off the developer's real work directory, credentials, and Drive."""
+    monkeypatch.setenv(WORKDIR_ENV, str(tmp_path / 'work'))
+    monkeypatch.delenv(ANALYSIS_WORKBOOK_ENV, raising=False)
+    monkeypatch.delenv('EMAIL_DOMAIN_RCLONE_REMOTE', raising=False)
 
 
 @pytest.fixture
-def analysis(backend: FakeBackend) -> AnalysisWorkbook:
-    return AnalysisWorkbook.create(backend, 'Email Domain Analysis')
+def drive() -> FakeDrive:
+    return FakeDrive()
+
+
+@pytest.fixture
+def staging(tmp_path: Path) -> Staging:
+    return Staging(tmp_path / 'work')
+
+
+@pytest.fixture
+def analysis(tmp_path: Path) -> AnalysisWorkbook:
+    return AnalysisWorkbook.open(tmp_path / 'analysis.xlsx')
+
+
+@pytest.fixture
+def excel() -> Recorder:
+    """Stands in for the Excel MCP server."""
+    return Recorder()

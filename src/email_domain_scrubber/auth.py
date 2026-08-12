@@ -1,42 +1,57 @@
-"""Google credentials for the Sheets and Drive APIs.
+"""OAuth access tokens for the Google Drive MCP connector.
 
 Credentials come from an **rclone** Google Drive remote, named by
-`EMAIL_DOMAIN_RCLONE_REMOTE`. rclone already holds a Drive OAuth client and refresh token, and
-rclone's full `drive` scope covers the Sheets API too (Sheets v4 accepts `auth/drive` for both
-reads and writes). The config is only ever read; refreshed access tokens are kept in memory, not
-written back.
+`EMAIL_DOMAIN_RCLONE_REMOTE`. rclone already holds a Drive OAuth client and refresh token. The
+config is only ever read; refreshed access tokens are kept in memory, not written back.
 
-The server acts as the signed-in user, so it can only reach workbooks that user can already open.
+The connector wants the literal scopes `drive.readonly` and `drive.file`, and it checks for those
+strings rather than for equivalent authority. A token carrying only the full `drive` scope — a
+strict superset in capability, and rclone's default — is refused with "The caller does not have
+permission". This was confirmed against the live endpoint, so the check below insists on both.
+rclone's `scope` takes a comma-separated list, which is how you grant them.
 
-The remote's `scope` is checked up front, but only against what rclone recorded at `rclone
-config` time; if the grant itself is narrower, `sheets._execute` translates the resulting 403
-into the same actionable message.
+The server acts as the signed-in user, so it can only reach files that user can already open.
+
+The OAuth client may be overridden with `EMAIL_DOMAIN_OAUTH_CLIENT_ID` /
+`EMAIL_DOMAIN_OAUTH_CLIENT_SECRET`. That matters because the connector is billed to the Cloud
+project owning the client, and *that* project is the one that has to have
+`drivemcp.googleapis.com` enabled — which may not be the project rclone was configured against.
 """
 
 from __future__ import annotations
 
 import configparser
-import functools
 import json
 import os
+import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
-from .errors import RcloneConfigError, ScrubberError
-
-DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
+from .errors import CredentialsExpired, RcloneConfigError, ScrubberError
 
 #: Name of an rclone remote of `type = drive` to borrow credentials from.
 RCLONE_REMOTE_ENV = 'EMAIL_DOMAIN_RCLONE_REMOTE'
+CLIENT_ID_ENV = 'EMAIL_DOMAIN_OAUTH_CLIENT_ID'
+CLIENT_SECRET_ENV = 'EMAIL_DOMAIN_OAUTH_CLIENT_SECRET'
 
-_TOKEN_URI = 'https://oauth2.googleapis.com/token'
+#: The scopes the connector requires by name. `drive.readonly` to read reports, `drive.file` to
+#: upload redacted copies. It will not accept the broader `drive` scope in their place.
+CONNECTOR_SCOPES = ('drive.readonly', 'drive.file')
+
+TOKEN_URI = 'https://oauth2.googleapis.com/token'
+
+#: Refresh this many seconds before the token actually expires, so a call that starts just
+#: under the wire does not land just over it.
+_EXPIRY_MARGIN = 60
 
 
-def credentials() -> Any:
-    """Credentials from the rclone remote named in the environment."""
-    return rclone_credentials(configured_remote())
+@dataclass(frozen=True)
+class OAuthClient:
+    """Everything needed to mint access tokens, read out of the rclone config."""
+
+    client_id: str
+    client_secret: str
+    refresh_token: str
 
 
 def configured_remote() -> str:
@@ -45,27 +60,19 @@ def configured_remote() -> str:
     if not remote:
         raise ScrubberError(
             f'No Google credentials configured. Set {RCLONE_REMOTE_ENV} to the name of an rclone '
-            'remote with `type = drive` and `scope = drive`, for example:\n'
+            f'remote with `type = drive` and `scope = drive,{",".join(CONNECTOR_SCOPES)}`, '
+            'for example:\n'
             f'  export {RCLONE_REMOTE_ENV}=aso'
         )
     return remote
 
 
 def login_hint() -> str:
-    """The command a human runs to sign in again. Opens a browser.
-
-    Error messages ask for this rather than spelling out the command, so the remote name in it is
-    always the configured one.
-    """
+    """The command a human runs to sign in again. Opens a browser."""
     remote = os.environ.get(RCLONE_REMOTE_ENV, '').strip()
     if not remote:
         return f'set {RCLONE_REMOTE_ENV} to an rclone Google Drive remote, then `rclone config`'
     return f'rclone config reconnect {remote}:'
-
-
-def credential_source() -> str:
-    """Human-readable description of where credentials are coming from."""
-    return f'rclone remote {configured_remote()!r} in {rclone_config_path()}'
 
 
 def rclone_config_path() -> Path:
@@ -74,14 +81,14 @@ def rclone_config_path() -> Path:
     return Path(override) if override else Path.home() / '.config' / 'rclone' / 'rclone.conf'
 
 
-def rclone_credentials(remote: str, config_path: Path | None = None) -> Any:
-    """Build Google credentials from an rclone `type = drive` remote.
+def credential_source() -> str:
+    """Human-readable description of where credentials are coming from."""
+    return f'rclone remote {configured_remote()!r} in {rclone_config_path()}'
 
-    Reads the OAuth client and refresh token rclone stored at `rclone config` time. The stored
-    access token is usually expired; google-auth refreshes it on first use.
-    """
-    from google.oauth2.credentials import Credentials
 
+def oauth_client(remote: str | None = None, config_path: Path | None = None) -> OAuthClient:
+    """Read the OAuth client and refresh token rclone stored at `rclone config` time."""
+    remote = remote or configured_remote()
     path = config_path or rclone_config_path()
     if not path.is_file():
         raise RcloneConfigError(
@@ -109,20 +116,33 @@ def rclone_credentials(remote: str, config_path: Path | None = None) -> Any:
             'Drive remote.'
         )
 
-    scope = section.get('scope', 'drive').strip() or 'drive'
-    if scope != 'drive':
+    granted = {
+        part.strip() for part in (section.get('scope') or 'drive').split(',') if part.strip()
+    }
+    missing = [scope for scope in CONNECTOR_SCOPES if scope not in granted]
+    if missing:
         raise RcloneConfigError(
-            f'rclone remote {remote!r} was authorized with scope {scope!r}. Reading and writing '
-            'workbooks needs the full "drive" scope; re-run `rclone config` for that remote.'
+            f'rclone remote {remote!r} was authorized with scope '
+            f'{",".join(sorted(granted)) or "drive"!r}, which is missing '
+            f'{" and ".join(missing)}. The Drive MCP connector checks for those exact scope '
+            'names and refuses a token that only carries the broader "drive" scope, even though '
+            'it grants strictly more. Set both on the remote and re-consent:\n'
+            f'  rclone config update {remote} scope drive,{",".join(CONNECTOR_SCOPES)}\n'
+            f'  rclone config reconnect {remote}:'
         )
 
-    client_id = section.get('client_id', '').strip()
-    client_secret = section.get('client_secret', '').strip()
+    # An explicit client wins: the connector is billed to the Cloud project owning the client,
+    # and that project is the one that needs drivemcp.googleapis.com enabled.
+    client_id = os.environ.get(CLIENT_ID_ENV, '').strip() or section.get('client_id', '').strip()
+    client_secret = (
+        os.environ.get(CLIENT_SECRET_ENV, '').strip() or section.get('client_secret', '').strip()
+    )
     if not (client_id and client_secret):
         raise RcloneConfigError(
             f"rclone remote {remote!r} has no client_id/client_secret, so it is using rclone's "
             'built-in OAuth client, whose secret is not in the config. Re-run `rclone config` '
-            'for that remote with your own Google OAuth client credentials.'
+            f'for that remote with your own Google OAuth client, or set {CLIENT_ID_ENV} and '
+            f'{CLIENT_SECRET_ENV}.'
         )
 
     try:
@@ -137,87 +157,65 @@ def rclone_credentials(remote: str, config_path: Path | None = None) -> Any:
             'Re-run `rclone config reconnect` for that remote.'
         )
 
-    return Credentials(
-        token=token.get('access_token'),
-        refresh_token=refresh_token,
-        token_uri=_TOKEN_URI,
-        client_id=client_id,
-        client_secret=client_secret,
-        # rclone's "drive" scope is the full auth/drive scope, which the Sheets API accepts.
-        scopes=[DRIVE_SCOPE],
-        expiry=_parse_expiry(token.get('expiry')),
-    )
+    return OAuthClient(client_id, client_secret, refresh_token)
 
 
-def _parse_expiry(value: str | None) -> datetime | None:
-    """rclone's RFC3339 expiry as the naive UTC datetime google-auth expects.
+class TokenSource:
+    """Mints and caches Drive access tokens from a refresh token.
 
-    Passing it lets google-auth refresh before making a doomed call. Returning None on anything
-    unparseable is safe: the credential is then treated as unexpired and refreshed reactively.
+    google-auth used to do this. It is a single form POST, so doing it directly drops a large
+    dependency tree in exchange for about twenty lines.
     """
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed.astimezone(UTC).replace(tzinfo=None) if parsed.tzinfo else parsed
 
+    def __init__(self, client: OAuthClient | None = None) -> None:
+        self._client = client
+        self._token = ''
+        self._expires_at = 0.0
 
-#: A syntactically valid file id that cannot exist. Asking for it proves the Sheets API accepted
-#: our token — a 404 means "authorized, no such file", where a scope problem would be a 403.
-_UNUSED_FILE_ID = '1' + 'z' * 43
+    async def token(self) -> str:
+        """A valid access token, refreshing if the cached one is close to expiry."""
+        if self._token and time.monotonic() < self._expires_at:
+            return self._token
+        if self._client is None:
+            self._client = oauth_client()
+        self._token, lifetime = await self._refresh(self._client)
+        self._expires_at = time.monotonic() + max(lifetime - _EXPIRY_MARGIN, 0)
+        return self._token
 
+    @staticmethod
+    async def _refresh(client: OAuthClient) -> tuple[str, float]:
+        import httpx2
 
-@dataclass(frozen=True)
-class AccessCheck:
-    """What `verify_access` established about the current credentials."""
-
-    source: str
-    account: str
-    drive_ok: bool
-    sheets_ok: bool
-
-
-def verify_access() -> AccessCheck:
-    """Prove the credentials actually work, and report which account they belong to.
-
-    Every failure mode here is one a human has to fix, so each raises a `ScrubberError` saying
-    what to do rather than surfacing Google's wording. The server acts as the signed-in user, so
-    the account name is the first thing to check when a workbook "cannot be found".
-    """
-    from googleapiclient.discovery import build
-
-    from .errors import WorkbookNotFound
-    from .sheets import _execute
-
-    creds = credentials()
-    drive = build('drive', 'v3', credentials=creds, cache_discovery=False)
-    about = _execute(drive.about().get(fields='user(emailAddress)'))
-    account = about.get('user', {}).get('emailAddress', '')
-
-    sheets_service = build('sheets', 'v4', credentials=creds, cache_discovery=False)
-    try:
-        _execute(
-            sheets_service.spreadsheets().get(
-                spreadsheetId=_UNUSED_FILE_ID, fields='spreadsheetId'
+        async with httpx2.AsyncClient(timeout=30) as http:
+            response = await http.post(
+                TOKEN_URI,
+                data={
+                    'client_id': client.client_id,
+                    'client_secret': client.client_secret,
+                    'refresh_token': client.refresh_token,
+                    'grant_type': 'refresh_token',
+                },
             )
-        )
-    except WorkbookNotFound:
-        pass  # Expected, and exactly what we wanted to learn: the token was accepted.
+        if response.status_code != 200:
+            # Google says only `invalid_grant: Bad Request` when a refresh token has been
+            # revoked — by a password change, an admin, or seven days of an app in testing —
+            # so the fix has to be spelled out for the caller.
+            raise CredentialsExpired(_token_error(response), login_hint())
+        payload = response.json()
+        return payload['access_token'], float(payload.get('expires_in', 3600))
 
-    return AccessCheck(source=credential_source(), account=account, drive_ok=True, sheets_ok=True)
 
+def _token_error(response: object) -> str:
+    """Everything Google told us about a failed refresh.
 
-@functools.cache
-def google_backend() -> Any:
-    """Build the live `SheetsBackend`. Cached so the discovery documents load once."""
-    from googleapiclient.discovery import build
-
-    from .sheets import GoogleBackend
-
-    creds = credentials()
-    return GoogleBackend(
-        sheets_service=build('sheets', 'v4', credentials=creds, cache_discovery=False),
-        drive_service=build('drive', 'v3', credentials=creds, cache_discovery=False),
-    )
+    Both halves matter: `error` is the diagnostic code (`invalid_grant` for a revoked token),
+    while `error_description` is often no more than "Bad Request".
+    """
+    status = f'HTTP {getattr(response, "status_code", "?")}'
+    try:
+        payload = response.json()  # type: ignore[attr-defined]
+    except Exception:
+        return status
+    parts = [payload.get('error'), payload.get('error_description')]
+    detail = ': '.join(part for part in parts if part)
+    return f'{status}: {detail}' if detail else status

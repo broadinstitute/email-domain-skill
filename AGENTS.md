@@ -2,24 +2,54 @@
 
 Skill and MCP server for use on platform usage metric reports that contain email domain names
 
+Reports are local Microsoft Excel (`.xlsx`) files. Google Sheets and CSV are out of scope.
+
+**Local is the default and the only working source.** Drive support (`drive.py`, `auth.py`, and
+everything about the connector below) is intact but broken — the rclone remote's scopes do not
+satisfy the connector — and is deliberately left to be finished later. `local.py` decides which of
+the two a reference names; treat the Drive sections here as describing unfinished work.
+
+## Architecture
+
+Four parts, each with one job:
+
+- **The analysis skill** judges risk and gets user approval.
+- **The `email-domain-scrubber` MCP server** (this repo) does everything deterministic and
+  auditable: fetching workbooks, finding domains, recording them, minting aliases, planning the
+  rewrite, and verifying it happened.
+- **The Excel MCP server** ([`excel-mcp-server`](https://github.com/haris-musa/excel-mcp-server))
+  applies the planned cell writes to a copy of the workbook.
+- **Google's Drive MCP connector** (`https://drivemcp.googleapis.com/mcp/v1`) is the only route
+  to Drive. This repo contains no Google API client code.
+
+The scrubber server is itself an MCP *client* of the Drive connector, so workbook bytes never
+pass through the model's context.
+
+The connector is read-mostly: `search_files`, `get_file_metadata`, `get_file_permissions`,
+`list_recent_files`, `read_file_content`, `download_file_content`, `create_file`, `copy_file`.
+There is **no update, delete, or move**. Two consequences shape everything else — the analysis
+workbook is kept locally rather than in Drive, and a redacted report is always published as a new
+file.
+
 Skill to perform risk analysis of each email domain:
 
 - use the MCP server to extract a list of domains to analysis
 - analyze email domain for the privacy risk of associating the domain to a specific person
 - explain analysis and justify recommendations to anonymize
 - obtain user approval for the analysis and recommendations
-- use the MCP server to store approved analysis and perform approved redactions
+- use the MCP server to store approved analysis and plan approved redactions
 
 MCP server to anonymize domains and create a structured analysis and anonymization report:
 
 - scan reports for email domain names (the analysis skill uses this to list domains to analyze)
 - store analysis results in a separate domain analysis workbook (the analysis skill calls this to report its results)
-- anonymize email domain names in the metrics reports
-- keep separate records of anonymizations
+- plan the cell writes that anonymize email domain names in the metrics reports
+- verify those writes landed, publish the result, and keep separate records of anonymizations
 
 ## Domain Analysis Workbook Schema
 
-This workbook is the memory of the scrubber skill and MCP server.
+This workbook is the memory of the scrubber skill and MCP server. It is a local `.xlsx` file, not
+a Drive file, because the Drive connector cannot update an existing file.
 
 ### *Workbooks* Sheet
 
@@ -35,7 +65,9 @@ There can be multiple workbook rows in this sheet
 Columns:
 
 - `DateExtracted`, the date the input workbook was scanned and the domain extracted from it
-- `Reference`, a direct Google Sheets link to the spreadsheet cell containing the domain
+- `Reference`, a locator for the cell containing the domain, of the form
+  `https://drive.google.com/file/d/<id>/view#<Sheet>!<A1>`. Drive cannot deep-link a cell of an
+  `.xlsx`, so the URL opens the file and the fragment names the cell.
 - `Domain`, the non-anonymized domain name found within the referenced cell
 
 There can be multiple `Reference`s for each unique `Domain`
@@ -61,6 +93,21 @@ stephenwolfram.com,High,Stephen Wolfram of Wolfram Research,anon3746
 pluralistic.net,Medium,Daily link blog of Cory Doctorow,
 broadinstitute.org,Low,Broad Institute,
 ```
+
+### Redactions Sheet
+
+Columns:
+
+- `DateRedacted`, the date the anonymized copy was published
+- `SourceURL`, the metrics workbook that was redacted
+- `RedactedURL`, the anonymized copy published to Drive
+- `Reference`, a locator for the rewritten cell *in the copy*
+- `Domain`, the domain that was replaced
+- `AnonymizedDomain`, what replaced it
+
+One row per cell actually rewritten. This is what satisfies "keep separate records of
+anonymizations": `DomainAnalysis` holds the mapping and `DomainReferences` holds the source
+locations, but neither records what was published, where, and when.
 
 ## Skill: Privacy Risk Analysis of Email Domains
 

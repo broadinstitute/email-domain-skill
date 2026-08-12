@@ -18,12 +18,21 @@ The `email-domain-scrubber` MCP server owns the data; you own the judgement. Nev
 analysis workbook or the metrics report — always go through the tools, so the record stays
 consistent.
 
-1. **Scan.** Call `scan_workbook` with the metrics workbook URL. It records every domain
-   occurrence and returns the domains awaiting analysis.
-   - If there is no analysis workbook yet, call `create_analysis_workbook` first and give the
-     user its URL to keep — it is the durable record across quarters.
+Reports are local Excel `.xlsx` files. Ask the user for the path if they have not given one; a
+relative path, an absolute path, and `~` all work. If they give you a URL instead of a path, ask
+them to download the file and tell you where it landed. If they point you at a Sheets or CSV file,
+tell them it must be converted to `.xlsx` first (File > Download > Microsoft Excel) rather than
+trying to work around it.
+
+One other MCP server is involved: the **Excel MCP server** is yours to drive, and it performs the
+cell writes in step 6.
+
+1. **Scan.** Call `scan_workbook` with the path to the metrics workbook. It reads the workbook in
+   place without modifying it, records every domain occurrence, and returns the domains awaiting
+   analysis. The analysis workbook is created automatically on first use; tell the user its path,
+   since it is the durable record across quarters.
 2. **List.** Call `list_domains_for_analysis` to get the work queue with reference counts and
-   example cell links.
+   example cell locators.
 3. **Analyze.** Research each domain per *Risk Analysis* below and assign a `Risk` per the
    taxonomy. Do the research — do not guess from the name's shape alone. A domain that looks
    personal may be a registered company, and a plain-looking one may be a single researcher.
@@ -33,14 +42,28 @@ consistent.
 5. **Store.** Call `store_domain_analysis` with the approved verdicts. The server assigns the
    `anonNNNN` alias — never invent one yourself. Pass `anonymize` explicitly only when the user
    overrode the default (anonymize iff High).
-6. **Redact.** Call `redact_workbook` with `dry_run=true`, show the user the cell count and
-   sample changes, and get approval. Then call it again without `dry_run`. Give the user the URL
-   of the anonymized copy and note that the original is unchanged.
-   - Check `remaining_domains` in the result. It should contain exactly the domains analyzed as
-     not needing anonymization. Anything else is a problem worth reporting.
+6. **Plan and apply the redaction.** Call `plan_redaction`. It changes nothing: it copies the
+   workbook into the work directory and returns `redacted_path` plus a list of `write_blocks`.
+   - Show the user `cells_to_change` and `sample_changes`, and get approval.
+   - Then, for **every** entry in `write_blocks`, call the Excel MCP server's
+     `write_data_to_excel` with `filepath` set to `redacted_path` and the block's `sheet_name`,
+     `start_cell`, and `data` passed through unchanged. Do not skip any, do not merge them, and
+     do not alter the values.
+7. **Finish.** Call `finish_redaction` with the same workbook and `redacted_path`. It re-reads the
+   file, refuses to finish if any block was missed, and records every change. Give the user the
+   path to the redacted file and note that the original is unchanged. Nothing is uploaded
+   anywhere — sharing the redacted file is the user's to do.
+   - Check `remaining_domains`. It should contain exactly the domains analyzed as not needing
+     anonymization. Anything else is a problem worth reporting.
+   - If it reports that writes were not applied, go back and apply the missing blocks. Do not try
+     to work around the check — it is the only thing standing between a missed write and a
+     report that still names someone.
 
 Batch your work: analyze all pending domains, then present them in one table and store them in
 one `store_domain_analysis` call. Do not go domain-by-domain through the approval loop.
+
+Step 6 is the only place you touch a spreadsheet directly, and step 7 is the only step that writes
+the redaction into the durable record.
 
 ## Risk Taxonomy
 
