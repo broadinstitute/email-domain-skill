@@ -5,7 +5,7 @@ A skill and an MCP server for handling email domain names in platform usage metr
 Quarterly usage metrics for a scientific research platform are full of user email domains. Most
 are harmless (`broadinstitute.org`, `nih.gov`, `gmail.com`), but some name a person — a personal
 lab domain, a single-researcher consultancy, a `username.github.io`. Those need to be anonymized
-before the report is published, and the decision needs an audit trail.
+before the report is shared, and the decision needs an audit trail.
 
 The split is deliberate:
 
@@ -19,71 +19,20 @@ The server never decides that something is risky, and the skill never invents an
 a report. Everything both of them know lives in one local Excel file, the **domain analysis
 workbook**.
 
-Reports are local Excel `.xlsx` files. Google Sheets and CSV are out of scope — convert them
-first (File > Download > Microsoft Excel).
+Reports are local Excel `.xlsx` files. Everything runs on your machine: no report is uploaded
+anywhere, and the file you point at is never modified. Google Sheets and CSV are out of scope —
+convert them to `.xlsx` first (File > Download > Microsoft Excel).
 
-Everything runs on your machine and nothing is uploaded. Google Drive support exists in the code
-(`src/email_domain_scrubber/drive.py`, via Google's Drive MCP connector) but is **currently broken
-and unfinished** — the rclone remote's scopes do not satisfy the connector. Use local paths.
+## Requirements
 
-## Setup
+- Python 3.12 and [uv](https://docs.astral.sh/uv/)
+- Claude Code
+- Nothing else: no accounts and no credentials.
 
-Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
+Neither server touches the network — your report stays on your machine. The skill's research step
+does search the web, but for the domain names themselves, not for anything else in the workbook.
 
-```bash
-uv sync
-```
-
-### Enable the Drive MCP API
-
-The connector is billed to the Google Cloud project that owns your OAuth client, and **that
-project must have `drivemcp.googleapis.com` enabled** — having the plain Drive API enabled is not
-enough and says nothing about this one. Enable both:
-
-```bash
-gcloud services enable drive.googleapis.com drivemcp.googleapis.com --project=<project>
-```
-
-If you skip this, every call fails with Google's own message naming the project and a console
-link. `check-auth` below reports it directly.
-
-### Authenticate
-
-Credentials come from an existing rclone Google Drive remote. rclone already holds a Drive OAuth
-client and refresh token. The config is only ever read; refreshed access tokens stay in memory and
-are never written back. The server acts as the signed-in user, so it can only reach files that
-user can already open.
-
-**The connector requires the scopes `drive.readonly` and `drive.file` by name.** It checks for
-those exact strings, not for equivalent authority, so rclone's default full `drive` scope — a
-strict superset — is refused with `The caller does not have permission`. rclone's `scope` takes a
-comma-separated list, so grant all three and re-consent:
-
-```bash
-rclone config update aso scope drive,drive.readonly,drive.file
-rclone config reconnect aso:          # opens a browser
-export EMAIL_DOMAIN_RCLONE_REMOTE=aso
-```
-
-The remote needs its own `client_id`/`client_secret` — with rclone's built-in OAuth client the
-secret is not in the config and cannot be used. Set `RCLONE_CONFIG` if your config is not at
-`~/.config/rclone/rclone.conf`.
-
-If the rclone remote's client belongs to a project where you cannot enable the Drive MCP API, use
-a client from a project where you can, keeping rclone's refresh token:
-
-```bash
-export EMAIL_DOMAIN_OAUTH_CLIENT_ID=...
-export EMAIL_DOMAIN_OAUTH_CLIENT_SECRET=...
-```
-
-Check it end to end:
-
-```bash
-uv run email-domain-scrubber check-auth
-```
-
-### Install as a plugin
+## Install
 
 This repo is its own Claude Code plugin marketplace. Installing the plugin registers the skill and
 both MCP servers for **every** project and session, not just this directory:
@@ -93,35 +42,42 @@ claude plugin marketplace add broadinstitute/email-domain-skill
 claude plugin install email-domain-scrubber@broadinstitute-email-domain
 ```
 
-To develop against a local clone instead, point the marketplace at the working tree. The plugin
-then runs the code in place, so edits take effect on the next `/reload-plugins`:
+That is the whole install. `uv` builds the server's environment from the lockfile the first time
+it starts, so the first call may take a few seconds longer than the rest.
+
+To work against a local clone instead, point the marketplace at the working tree. The plugin then
+runs the code in place, so your edits take effect on the next `/reload-plugins`:
 
 ```bash
 claude plugin marketplace add /path/to/email-domain-skill
 claude plugin install email-domain-scrubber@broadinstitute-email-domain
 ```
 
-Either way, `${CLAUDE_PLUGIN_ROOT}` resolves the `uv --project` path, so there is no path to
+Either way, `${CLAUDE_PLUGIN_ROOT}` resolves the path in `uv run --project`, so there is nothing to
 hand-edit. It is `--project` rather than `--directory` on purpose: `--directory` would change the
-server's working directory to the plugin, and relative workbook paths would resolve against the
-wrong place. Verify with `claude plugin details email-domain-scrubber` (expect 1 skill, 2 MCP
-servers) and `claude mcp list` (expect both `plugin:email-domain-scrubber:*` entries connected).
+server's working directory to the plugin, and a relative workbook path would then resolve against
+the wrong place.
 
-The plugin defaults `EMAIL_DOMAIN_RCLONE_REMOTE` to `aso`. Export a different value to override it;
-see [Authenticate](#authenticate).
+### Check the install
 
+```bash
+claude plugin details email-domain-scrubber   # expect: 1 skill, 2 MCP servers
+claude mcp list                               # expect: both plugin:email-domain-scrubber:* connected
+```
+
+The two servers appear as `plugin:email-domain-scrubber:email-domain-scrubber` and
+`plugin:email-domain-scrubber:excel`.
 [`excel-mcp-server`](https://github.com/haris-musa/excel-mcp-server) needs no Microsoft Excel
-installation. Leave `EXCEL_FILES_PATH` unset so it accepts the absolute paths this server hands
-it.
+installation. Leave `EXCEL_FILES_PATH` unset so it accepts the absolute paths this server hands it.
 
-`.mcp.json` at the repo root registers both servers for work inside this directory without the
-plugin. It is the same pair of servers, so with the plugin also enabled here they load twice under
-different names — harmless, but disable one if the duplicate tool lists get in the way.
+`.mcp.json` at the repo root registers the same two servers for work inside this directory without
+the plugin. With the plugin also enabled here they load twice under different names — harmless, but
+disable one if the duplicate tool lists get in the way.
 
 ### Optional settings
 
 ```bash
-# Where workbooks are staged and the analysis record is kept.
+# Where the redacted copy is written and the analysis record is kept.
 export EMAIL_DOMAIN_WORKDIR=~/.cache/email-domain-scrubber
 
 # The analysis workbook, if you want it somewhere else (e.g. in a git repo).
@@ -133,23 +89,36 @@ file no matter which project you invoke the skill from.
 
 ## Usage
 
-Point Claude at a metrics workbook:
+Point Claude at an `.xlsx` on disk. A relative or absolute path both work, as does `~`:
 
 > Analyze the email domains in `~/Downloads/Q1 Metrics.xlsx` and anonymize the risky ones.
 
-The skill will scan the workbook, research each new domain, present a table of risk verdicts for
-your approval, show you what the redaction will change, then produce the anonymized copy. The
-original is never modified, and the copy is left on disk for you to share as you see fit.
+The skill takes it from there:
+
+1. **Scans** the workbook in place, recording every domain occurrence and the cell it came from.
+2. **Researches** each domain it has not seen before, and assigns a risk level with a written
+   justification.
+3. **Presents a table** of `Domain | Risk | Explanation | Action` and waits for your approval. Say
+   which verdicts you disagree with and it revises them.
+4. **Shows you the changes** it intends to make — how many cells, with examples — and waits again.
+5. **Writes the redacted copy** as `<name> (anonymized).xlsx` in the work directory, then re-reads
+   it and refuses to finish if any domain that should have been replaced is still there.
+
+You end up with the path to a redacted copy and an audit trail in the analysis workbook. Your
+original is untouched, nothing is uploaded, and sharing the copy is yours to do.
+
+Domains it has already analyzed in a previous quarter keep their existing verdict and alias, so a
+follow-up report only asks you about what is new.
 
 ## MCP tools
 
 | Tool | What it does |
 | --- | --- |
-| `scan_workbook` | Reads every cell of the local `.xlsx`, records each domain occurrence with a locator, and opens a blank analysis row per unique domain. |
+| `scan_workbook` | Reads every cell of the `.xlsx`, records each domain occurrence with a locator, and opens a blank analysis row per unique domain. |
 | `list_domains_for_analysis` | The work queue: domains with no verdict yet, plus how often and where each was seen. |
 | `store_domain_analysis` | Writes approved `Risk`/`Explanation`, minting an alias for each domain to anonymize. |
 | `plan_redaction` | Copies the workbook into the work directory and returns the `write_blocks` that anonymize it. Changes nothing. |
-| `finish_redaction` | Verifies the copy was actually rewritten and records every change. Uploads nothing. |
+| `finish_redaction` | Verifies the copy was actually rewritten and records every change. |
 
 Between the last two, the Excel MCP server applies each block with `write_data_to_excel`.
 
@@ -178,7 +147,7 @@ reports it describes.
 
 `Redactions` is what satisfies "keep separate records of anonymizations": `DomainAnalysis` holds
 the mapping and `DomainReferences` holds the source locations, but neither records what was
-published, where, and when.
+produced, where, and when.
 
 `DomainAnalysis` example:
 
@@ -191,31 +160,26 @@ broadinstitute.org,Low,Broad Institute,
 
 ## Design decisions
 
-**This server is the Drive connector's client, not Claude.** `download_file_content` returns
-base64, so a workbook routed through the conversation would cost roughly 350k tokens per
-megabyte, twice. Calling the connector from inside the server keeps bytes out of context
-entirely, and workbook size stops mattering.
+**Workbook bytes never enter the conversation.** The server reads the file from disk itself. A
+megabyte of `.xlsx` routed through the model as base64 would cost roughly 350k tokens, twice, so
+reading it inside the server means workbook size stops mattering.
 
-**The analysis workbook is local because the connector cannot update a file.** Its eight tools
-are `search_files`, `get_file_metadata`, `get_file_permissions`, `list_recent_files`,
-`read_file_content`, `download_file_content`, `create_file`, and `copy_file` — read-mostly, with
-no update, delete, or move. A Drive-hosted record could only ever be rewritten as a new file per
-edit.
+**The source workbook is read in place and never modified.** There is nothing to download and
+nothing to cache, and copying it first would only create a second file to keep straight.
 
-**Redaction creates; it never edits in place.** Neither the Drive original nor the staged local
-copy of it is touched. `plan_redaction` byte-copies the staged workbook to
-`<name> (anonymized).xlsx`, the Excel MCP server rewrites that, and `finish_redaction` uploads it
-as a new Drive file. If the local name is taken the next copy becomes `<name> (anonymized) 2` —
-an already-published copy is never overwritten, and re-redacting is never a silent no-op.
+**Redaction creates; it never edits in place.** `plan_redaction` byte-copies the workbook to
+`<name> (anonymized).xlsx` in the work directory — not beside your original, so nothing unexpected
+appears next to the file you pointed at. The Excel MCP server rewrites the copy. If the name is
+taken the next copy becomes `<name> (anonymized) 2`, so an earlier copy you may already have shared
+is never overwritten and re-redacting is never a silent no-op.
 
-**`finish_redaction` re-reads the file before publishing.** An external server performs the
-writes now, so a produced plan no longer implies applied edits. If any domain that should have
-been replaced is still present, it refuses to upload rather than publishing a half-redacted
-report.
+**`finish_redaction` re-reads the file before recording anything.** An external server performs
+the writes, so a produced plan does not prove the edits landed. If any domain that should have been
+replaced is still present, it refuses rather than certifying a half-redacted report.
 
-**Redaction refuses to run while any domain is unanalyzed.** Nothing unreviewed can reach a
-published report. Domains analyzed as *not* needing anonymization are left in place on purpose,
-and are reported back as `domains_left_as_is` so the outcome is explicit.
+**Redaction refuses to run while any domain is unanalyzed.** Nothing unreviewed can reach a shared
+report. Domains analyzed as *not* needing anonymization are left in place on purpose, and are
+reported back as `domains_left_as_is` so the outcome is explicit.
 
 **Write blocks never span a gap.** Edits are grouped into runs of consecutive rows in one column,
 so a contiguous column of addresses becomes a single `write_data_to_excel` call. Gaps are not
@@ -231,10 +195,6 @@ and are not derived from the domain (which would make the mapping recoverable by
 guessed domain list). Once assigned, an alias is never changed or removed, so a domain keeps the
 same alias across quarters even if a later analysis revises its risk.
 
-**Downloads are cached against `modifiedTime`.** Re-scanning a workbook is a normal thing to do
-and should not mean re-downloading it. Absent a `modifiedTime` freshness cannot be proven, so the
-file is re-fetched rather than assumed current.
-
 **Bare domains are matched more strictly than addresses.** In `alice@smithlab.io` the `@` is
 strong evidence, so any casing and any alphabetic TLD is accepted. A bare `smithlab.io` in a
 `Domain` column has no such evidence, so it must be entirely lowercase and end in a recognised
@@ -246,15 +206,11 @@ TLD. Metric reports are full of dotted tokens that are not domains — `Total.Co
 - **Redaction loses charts, pivot tables, and images.** The copy is byte-identical until the
   Excel MCP server opens it, and that round-trips through openpyxl, which does not preserve them.
   Cell values, formulas elsewhere in the workbook, and most formatting survive.
-- **Pass `folder_id` to `finish_redaction`.** With no parent specified the connector picks one
-  itself, and it has been observed putting the file in a shared drive root rather than My Drive.
-  If where the report lands matters, say so explicitly.
-- **`Reference` is not a cell deep link.** A Google Sheet could be linked with `#gid=…&range=…`;
-  an `.xlsx` in Drive cannot. The format is
-  `https://drive.google.com/file/d/<id>/view#<Sheet>!<A1>` — it opens the file, and the fragment
-  names the cell for a human.
+- **`Reference` is not a cell deep link.** It is a `file://` URL with the sheet and cell in the
+  fragment — `file:///path/to/report.xlsx#<Sheet>!<A1>` — which identifies the cell for a human
+  reading the audit trail but will not open a spreadsheet at it.
 - **Only `.xlsx` is supported.** Convert Google Sheets and CSV files first (File > Download >
-  Microsoft Excel, then upload).
+  Microsoft Excel).
 - **Formulas are read as their cached values,** and a rewritten cell becomes a literal string. A
   workbook written by a tool that does not compute formulas has no cached value, and such a cell
   reads as empty.
@@ -268,13 +224,10 @@ TLD. Metric reports are full of dotted tokens that are not domains — `Total.Co
 ## Development
 
 ```bash
-uv run pytest          # unit tests: a fake Drive connector, real .xlsx files
-uv run pytest --live   # also hits the real connector; creates and removes scratch Drive files
+uv sync
+uv run pytest          # offline: real .xlsx files, no network
 uv run ruff check .
 uv run ruff format --check .
 ```
 
-Live teardown deletes by file id through the Drive REST API, since the connector has no delete
-and `create_file` may place files in a shared drive where a name-based sweep would miss them.
-Scratch files are named `zz-scrubber-test-*`; anything that could not be removed is listed at the
-end of the run.
+See `AGENTS.md` for the architecture, the opt-in live test suite, and what is still unfinished.

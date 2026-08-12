@@ -18,13 +18,11 @@ The `email-domain-scrubber` MCP server owns the data; you own the judgement. Nev
 analysis workbook or the metrics report — always go through the tools, so the record stays
 consistent.
 
-Reports are local Excel `.xlsx` files. Ask the user for the path if they have not given one. If
-they point you at a Google Sheet or a CSV, tell them it must be converted to `.xlsx` first
-(File > Download > Microsoft Excel) rather than trying to work around it.
-
-Google Drive support exists in the server but is currently broken and unfinished. Do not offer it,
-do not pass Drive URLs or file ids, and if a user supplies one, ask them to download the file and
-give you the local path instead.
+Reports are local Excel `.xlsx` files. Ask the user for the path if they have not given one; a
+relative path, an absolute path, and `~` all work. If they give you a URL instead of a path, ask
+them to download the file and tell you where it landed. If they point you at a Sheets or CSV file,
+tell them it must be converted to `.xlsx` first (File > Download > Microsoft Excel) rather than
+trying to work around it.
 
 One other MCP server is involved: the **Excel MCP server** is yours to drive, and it performs the
 cell writes in step 6.
