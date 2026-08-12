@@ -9,7 +9,7 @@ import json
 import pytest
 
 from email_domain_scrubber import auth
-from email_domain_scrubber.errors import RcloneConfigError
+from email_domain_scrubber.errors import RcloneConfigError, ScrubberError
 
 TOKEN = {
     'access_token': 'expired-access-token',
@@ -103,16 +103,16 @@ def test_unparseable_token_is_rejected(tmp_path):
         auth.rclone_credentials('aso', _write_config(tmp_path, token='{not json'))
 
 
-def test_credentials_prefers_rclone_when_the_remote_is_named(tmp_path, monkeypatch):
+def test_credentials_come_from_the_named_remote(tmp_path, monkeypatch):
     monkeypatch.setenv(auth.RCLONE_REMOTE_ENV, 'aso')
     monkeypatch.setenv('RCLONE_CONFIG', str(_write_config(tmp_path)))
     assert auth.credentials().refresh_token == 'the-refresh-token'
 
 
-def test_credentials_falls_back_to_adc(monkeypatch):
+def test_credentials_without_a_configured_remote_says_what_to_set(monkeypatch):
     monkeypatch.delenv(auth.RCLONE_REMOTE_ENV, raising=False)
-    monkeypatch.setattr(auth, 'adc_credentials', lambda: 'adc-sentinel')
-    assert auth.credentials() == 'adc-sentinel'
+    with pytest.raises(ScrubberError, match=auth.RCLONE_REMOTE_ENV):
+        auth.credentials()
 
 
 def test_config_path_honours_rclones_own_override(monkeypatch):

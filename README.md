@@ -26,13 +26,10 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 uv sync
 ```
 
-Then authenticate, either way. The server acts as the signed-in user, so it can only reach
-workbooks that user can already open.
-
-**Option A — an existing rclone Google Drive remote.** Use this where `gcloud auth
-application-default login` is unavailable. rclone already holds a Drive OAuth client and refresh
-token, and its full `drive` scope covers the Sheets API too. The config is only ever read;
-refreshed access tokens stay in memory and are never written back.
+Then authenticate with an existing rclone Google Drive remote. rclone already holds a Drive OAuth
+client and refresh token, and its full `drive` scope covers the Sheets API too. The config is
+only ever read; refreshed access tokens stay in memory and are never written back. The server
+acts as the signed-in user, so it can only reach workbooks that user can already open.
 
 ```bash
 export EMAIL_DOMAIN_RCLONE_REMOTE=aso    # a remote with `type = drive` and `scope = drive`
@@ -40,16 +37,10 @@ export EMAIL_DOMAIN_RCLONE_REMOTE=aso    # a remote with `type = drive` and `sco
 
 The remote needs its own `client_id`/`client_secret` — with rclone's built-in OAuth client the
 secret is not in the config and cannot be used. Set `RCLONE_CONFIG` if your config is not at
-`~/.config/rclone/rclone.conf`.
-
-**Option B — Application Default Credentials.** User credentials carry the scopes granted at
-login time, so `--scopes` is required:
+`~/.config/rclone/rclone.conf`. Check it end to end with:
 
 ```bash
-gcloud auth application-default login --scopes=\
-https://www.googleapis.com/auth/spreadsheets,\
-https://www.googleapis.com/auth/drive,\
-https://www.googleapis.com/auth/cloud-platform
+uv run email-domain-scrubber check-auth
 ```
 
 Register the server. `.mcp.json` in this repo already does it for work inside this directory; for

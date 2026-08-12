@@ -1,21 +1,16 @@
 """Google credentials for the Sheets and Drive APIs.
 
-Two sources, in priority order:
+Credentials come from an **rclone** Google Drive remote, named by
+`EMAIL_DOMAIN_RCLONE_REMOTE`. rclone already holds a Drive OAuth client and refresh token, and
+rclone's full `drive` scope covers the Sheets API too (Sheets v4 accepts `auth/drive` for both
+reads and writes). The config is only ever read; refreshed access tokens are kept in memory, not
+written back.
 
-1. An **rclone** Google Drive remote, if `EMAIL_DOMAIN_RCLONE_REMOTE` names one. Useful where
-   `gcloud auth application-default login` is unavailable: rclone already holds a Drive OAuth
-   client and refresh token, and rclone's full `drive` scope covers the Sheets API too (Sheets
-   v4 accepts `auth/drive` for both reads and writes). The config is only ever read; refreshed
-   access tokens are kept in memory, not written back.
-2. **Application Default Credentials** otherwise.
+The server acts as the signed-in user, so it can only reach workbooks that user can already open.
 
-Either way the server acts as the signed-in user, so it can only reach workbooks that user can
-already open.
-
-User ADC credentials carry the scopes granted at login time and ignore any scopes requested here,
-and they usually do not report the scopes they hold — so a missing scope cannot reliably be
-detected up front. The check in `adc_credentials` catches it when the credentials do report
-scopes; otherwise `sheets._execute` translates the resulting 403 into the same actionable message.
+The remote's `scope` is checked up front, but only against what rclone recorded at `rclone
+config` time; if the grant itself is narrower, `sheets._execute` translates the resulting 403
+into the same actionable message.
 """
 
 from __future__ import annotations
@@ -29,11 +24,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .errors import GCLOUD_LOGIN_HINT, MissingScopes, RcloneConfigError, ScrubberError
+from .errors import RcloneConfigError, ScrubberError
 
 DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
-SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets'
-SCOPES = (SHEETS_SCOPE, DRIVE_SCOPE)
 
 #: Name of an rclone remote of `type = drive` to borrow credentials from.
 RCLONE_REMOTE_ENV = 'EMAIL_DOMAIN_RCLONE_REMOTE'
@@ -42,46 +35,37 @@ _TOKEN_URI = 'https://oauth2.googleapis.com/token'
 
 
 def credentials() -> Any:
-    """Credentials from the rclone remote named in the environment, or from ADC."""
+    """Credentials from the rclone remote named in the environment."""
+    return rclone_credentials(configured_remote())
+
+
+def configured_remote() -> str:
+    """The rclone remote to borrow credentials from, or raise saying how to name one."""
     remote = os.environ.get(RCLONE_REMOTE_ENV, '').strip()
-    return rclone_credentials(remote) if remote else adc_credentials()
+    if not remote:
+        raise ScrubberError(
+            f'No Google credentials configured. Set {RCLONE_REMOTE_ENV} to the name of an rclone '
+            'remote with `type = drive` and `scope = drive`, for example:\n'
+            f'  export {RCLONE_REMOTE_ENV}=aso'
+        )
+    return remote
 
 
 def login_hint() -> str:
-    """The command a human runs to sign in again, for whichever credential source is configured.
+    """The command a human runs to sign in again. Opens a browser.
 
-    Both open a browser. Which one is right depends only on where credentials are coming from,
-    so this is the single place that decides, and error messages ask it rather than guessing.
+    Error messages ask for this rather than spelling out the command, so the remote name in it is
+    always the configured one.
     """
     remote = os.environ.get(RCLONE_REMOTE_ENV, '').strip()
-    return f'rclone config reconnect {remote}:' if remote else GCLOUD_LOGIN_HINT
+    if not remote:
+        return f'set {RCLONE_REMOTE_ENV} to an rclone Google Drive remote, then `rclone config`'
+    return f'rclone config reconnect {remote}:'
 
 
 def credential_source() -> str:
     """Human-readable description of where credentials are coming from."""
-    remote = os.environ.get(RCLONE_REMOTE_ENV, '').strip()
-    if remote:
-        return f'rclone remote {remote!r} in {rclone_config_path()}'
-    return 'Google application default credentials'
-
-
-def adc_credentials() -> Any:
-    import google.auth
-    from google.auth.exceptions import DefaultCredentialsError
-
-    try:
-        creds, _ = google.auth.default(scopes=list(SCOPES))
-    except DefaultCredentialsError as exc:
-        raise ScrubberError(
-            f'No Google application default credentials found. Either run:\n'
-            f'  {GCLOUD_LOGIN_HINT}\n'
-            f'or set {RCLONE_REMOTE_ENV} to the name of an rclone Google Drive remote.'
-        ) from exc
-
-    granted = set(getattr(creds, 'scopes', None) or ())
-    if granted and not granted.issuperset(SCOPES):
-        raise MissingScopes(f'missing {", ".join(sorted(set(SCOPES) - granted))}')
-    return creds
+    return f'rclone remote {configured_remote()!r} in {rclone_config_path()}'
 
 
 def rclone_config_path() -> Path:
@@ -101,8 +85,8 @@ def rclone_credentials(remote: str, config_path: Path | None = None) -> Any:
     path = config_path or rclone_config_path()
     if not path.is_file():
         raise RcloneConfigError(
-            f'No rclone config at {path}. Set RCLONE_CONFIG to its location, or unset '
-            f'{RCLONE_REMOTE_ENV} to use application default credentials instead.'
+            f'No rclone config at {path}. Set RCLONE_CONFIG to its location, or run '
+            '`rclone config` to create a Google Drive remote.'
         )
 
     parser = configparser.ConfigParser()
