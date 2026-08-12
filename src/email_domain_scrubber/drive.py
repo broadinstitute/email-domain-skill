@@ -73,14 +73,18 @@ def file_url(file_id: str) -> str:
     return f'https://drive.google.com/file/d/{file_id}/view'
 
 
-def cell_reference(file_id: str, sheet_title: str, a1: str) -> str:
-    """A locator for one cell of a Drive-hosted workbook.
+def cell_reference(file_id_or_url: str, sheet_title: str, a1: str) -> str:
+    """A locator for one cell of a workbook.
 
-    A Google Sheet could be deep-linked to a selected cell with `#gid=…&range=…`. An `.xlsx` in
-    Drive has no such link, so the URL opens the file and the fragment names the cell for a
-    human reading the audit trail.
+    A Google Sheet could be deep-linked to a selected cell with `#gid=…&range=…`. An `.xlsx` has
+    no such link, so the URL opens the file and the fragment names the cell for a human reading
+    the audit trail.
+
+    Accepts either a Drive file id or a full URL, so a local workbook's `file://` URL produces
+    the same shape of locator as a Drive one.
     """
-    return f'{file_url(file_id)}#{sheet_title}!{a1}'
+    base = file_id_or_url if '://' in file_id_or_url else file_url(file_id_or_url)
+    return f'{base}#{sheet_title}!{a1}'
 
 
 @dataclass(frozen=True)

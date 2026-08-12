@@ -1,9 +1,9 @@
 """Scanning a metrics workbook for email domain names.
 
-The workbook is fetched from Drive through the MCP connector into the local staging directory,
-then read with openpyxl. Only `.xlsx` is in scope: the conversion dance that used to turn Drive
-uploads into native Google Sheets is gone, and with it the stale-conversion and shared-drive
-lookup edge cases it needed.
+A local `.xlsx` is read where it lies. A Drive reference is fetched through the MCP connector into
+the local staging directory first. Either way the workbook is read with openpyxl. Only `.xlsx` is
+in scope: the conversion dance that used to turn Drive uploads into native Google Sheets is gone,
+and with it the stale-conversion and shared-drive lookup edge cases it needed.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import xlsx
+from . import local, xlsx
 from .domains import extract_domains
 from .drive import Drive, FileInfo, cell_reference, file_url, parse_file_id
 from .errors import UnsupportedWorkbook
@@ -33,21 +33,33 @@ class ScanHit:
 
 @dataclass(frozen=True)
 class StagedWorkbook:
-    """A Drive workbook downloaded to local disk and ready to read."""
+    """A workbook on local disk and ready to read — opened in place, or downloaded from Drive."""
 
     info: FileInfo
     path: Path
     downloaded: bool
+    source_url: str = ''
 
     @property
     def url(self) -> str:
-        return file_url(self.info.file_id)
+        return self.source_url or file_url(self.info.file_id)
 
 
 async def stage_workbook(
     drive: Drive, staging: Staging, url_or_id: str, *, force: bool = False
 ) -> StagedWorkbook:
-    """Download a Drive `.xlsx` into the staging directory, reusing an up-to-date local copy."""
+    """Make a `.xlsx` available on local disk.
+
+    A local path is used where it lies: there is nothing to download and nothing to cache, and
+    copying it would only create a second file to keep straight. A Drive reference is downloaded
+    into the staging directory, reusing an up-to-date local copy.
+    """
+    if local.is_local_reference(url_or_id):
+        path = local.resolve(url_or_id)
+        return StagedWorkbook(
+            info=local.info(path), path=path, downloaded=False, source_url=local.url(path)
+        )
+
     file_id = parse_file_id(url_or_id)
     info = await drive.get_metadata(file_id)
 

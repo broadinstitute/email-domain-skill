@@ -2,8 +2,12 @@
 
 Skill and MCP server for use on platform usage metric reports that contain email domain names
 
-Reports are Microsoft Excel (`.xlsx`) files in Google Drive. Google Sheets and CSV are out of
-scope.
+Reports are local Microsoft Excel (`.xlsx`) files. Google Sheets and CSV are out of scope.
+
+**Local is the default and the only working source.** Drive support (`drive.py`, `auth.py`, and
+everything about the connector below) is intact but broken — the rclone remote's scopes do not
+satisfy the connector — and is deliberately left to be finished later. `local.py` decides which of
+the two a reference names; treat the Drive sections here as describing unfinished work.
 
 ## Architecture
 

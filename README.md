@@ -11,16 +11,20 @@ The split is deliberate:
 
 - **The skill** does the judgement: researching each domain, assigning a risk level, explaining
   why, and getting your approval.
-- **This MCP server** does everything deterministic and auditable: fetching the workbook, finding
+- **This MCP server** does everything deterministic and auditable: reading the workbook, finding
   the domains, recording them, minting aliases, planning the rewrite, and proving it happened.
 - **The Excel MCP server** applies the rewrite to a copy of the workbook.
-- **Google's Drive MCP connector** is the only route to Drive. There is no Google API code here.
 
 The server never decides that something is risky, and the skill never invents an alias or edits
 a report. Everything both of them know lives in one local Excel file, the **domain analysis
 workbook**.
 
-Reports are Excel `.xlsx` files in Google Drive. Google Sheets and CSV are out of scope.
+Reports are local Excel `.xlsx` files. Google Sheets and CSV are out of scope — convert them
+first (File > Download > Microsoft Excel).
+
+Everything runs on your machine and nothing is uploaded. Google Drive support exists in the code
+(`src/email_domain_scrubber/drive.py`, via Google's Drive MCP connector) but is **currently broken
+and unfinished** — the rclone remote's scopes do not satisfy the connector. Use local paths.
 
 ## Setup
 
@@ -129,22 +133,21 @@ file no matter which project you invoke the skill from.
 
 Point Claude at a metrics workbook:
 
-> Analyze the email domains in
-> `https://drive.google.com/file/d/1abc.../view` and anonymize the risky ones.
+> Analyze the email domains in `~/Downloads/Q1 Metrics.xlsx` and anonymize the risky ones.
 
 The skill will scan the workbook, research each new domain, present a table of risk verdicts for
-your approval, show you what the redaction will change, then produce and publish the anonymized
-copy.
+your approval, show you what the redaction will change, then produce the anonymized copy. The
+original is never modified, and the copy is left on disk for you to share as you see fit.
 
 ## MCP tools
 
 | Tool | What it does |
 | --- | --- |
-| `scan_workbook` | Downloads the `.xlsx` from Drive, reads every cell, records each domain occurrence with a locator, and opens a blank analysis row per unique domain. |
+| `scan_workbook` | Reads every cell of the local `.xlsx`, records each domain occurrence with a locator, and opens a blank analysis row per unique domain. |
 | `list_domains_for_analysis` | The work queue: domains with no verdict yet, plus how often and where each was seen. |
 | `store_domain_analysis` | Writes approved `Risk`/`Explanation`, minting an alias for each domain to anonymize. |
-| `plan_redaction` | Copies the workbook locally and returns the `write_blocks` that anonymize it. Publishes nothing. |
-| `finish_redaction` | Verifies the copy was actually rewritten, uploads it to Drive, and records every change. |
+| `plan_redaction` | Copies the workbook into the work directory and returns the `write_blocks` that anonymize it. Changes nothing. |
+| `finish_redaction` | Verifies the copy was actually rewritten and records every change. Uploads nothing. |
 
 Between the last two, the Excel MCP server applies each block with `write_data_to_excel`.
 
@@ -155,7 +158,7 @@ scan_workbook ──▶ list_domains_for_analysis ──▶ (research, approve) 
                                                                                   │
        ┌──────────────────────────────────────────────────────────────────────────┘
        ▼
-plan_redaction ──▶ excel: write_data_to_excel × N blocks ──▶ finish_redaction ──▶ Drive
+plan_redaction ──▶ excel: write_data_to_excel × N blocks ──▶ finish_redaction ──▶ redacted .xlsx
 ```
 
 ## Domain analysis workbook
