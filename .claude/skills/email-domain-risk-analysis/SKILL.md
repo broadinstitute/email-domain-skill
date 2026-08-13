@@ -71,11 +71,12 @@ the redaction into the durable record.
 
 - Personal name or pseudonym: `johnsmith.org`, `smithlab.io`, `dr-doe-research.com`
 - Personal GitHub / developer hosting: `username.github.io`, `username.netlify.app`
+- Single-principal academic or consulting entities: domains that are owned by one researcher or consultant
 
 **Medium risk** — the name narrows to a very small set of people.
 
-- Single-principal academic or consulting entities: domains owned by one researcher or consultant
 - Small independent labs and niche startups: fewer than 3 identifiable individuals
+- Probable single-principal academic or consulting entities: domains that are deemed single-principle with low confidence
 - Niche departmental or personal academic subdomains: highly specific subdomains resolving
   directly to a single server
 
@@ -97,6 +98,7 @@ Do **not** factor in:
 - Whether the individual is already publicly known — a public figure's personal domain is still
   a personal domain. Note the public-figure status in the explanation and let the user decide
   whether to override.
+- Email usernames - we only want to consider **domains**, not individual email addresses.
 
 ## Risk Analysis
 
