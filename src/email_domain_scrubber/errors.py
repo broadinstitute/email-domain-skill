@@ -35,19 +35,36 @@ class UnanalyzedDomains(ScrubberError):
         )
 
 
-class RedactionNotApplied(ScrubberError):
-    """The redacted file still holds domains that the plan said would be replaced.
+class InvalidRisk(ScrubberError):
+    """A DomainAnalysis row holds a Risk outside the taxonomy.
 
-    An external MCP server does the writing, so "the plan was produced" does not imply "the edits
-    landed". This is what catches a write step that was skipped or only half ran.
+    Reachable only by hand-editing the analysis workbook, which is a supported thing to do — so
+    the message names the row to fix rather than treating it as corruption.
+    """
+
+    def __init__(self, domain: str, risk: str) -> None:
+        self.domain = domain
+        self.risk = risk
+        super().__init__(
+            f'DomainAnalysis row for {domain!r} has Risk {risk!r}, which is not one of High, '
+            'Medium, or Low. Fix that cell in the analysis workbook and try again.'
+        )
+
+
+class RedactionNotApplied(ScrubberError):
+    """The redacted file still holds domains that should have been replaced.
+
+    Written, then read back: this catches a write that did not land, whatever the reason — an
+    unwritable copy, a value openpyxl declined to set, a domain reachable only through a formula
+    result. Raised rather than reported, so a half-redacted file is never certified.
     """
 
     def __init__(self, path: str, domains: list[str]) -> None:
         self.domains = domains
         super().__init__(
             f'{path} still contains {len(domains)} domain(s) that should have been replaced: '
-            f'{", ".join(domains[:20])}. Apply every write block from plan_redaction with the '
-            'Excel MCP server before calling finish_redaction.'
+            f'{", ".join(domains[:20])}. The redacted copy was left in place for inspection; do '
+            'not share it.'
         )
 
 

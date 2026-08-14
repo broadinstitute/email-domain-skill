@@ -1,27 +1,29 @@
-"""MCP server for scanning, recording, and anonymizing email domains in Excel metrics reports.
+"""MCP server for scanning, researching, recording, and anonymizing email domains in Excel
+metrics reports.
 
-Division of labour, across three servers:
+Division of labour, across two parts:
 
-* **This server** does everything deterministic and auditable — reading the workbook from disk,
-  finding domains, persisting them, minting aliases, planning the redaction, and verifying it
-  landed.
-* **The Excel MCP server** applies the planned writes to the copied workbook. Point it at the
-  `redacted_path` and `write_blocks` that `plan_redaction` returns.
-* **The analysis skill** does the judgement — deciding each domain's `Risk` and whether it needs
-  anonymizing — and gets user approval before calling `store_domain_analysis` or
-  `finish_redaction`.
+* **This server** does everything factual and everything that writes — reading the workbook from
+  disk, finding domains, researching them, persisting verdicts, minting aliases, rewriting the
+  redacted copy, verifying it, and recording what changed.
+* **The analysis skill** does the judgement — reading the evidence this server gathers, deciding
+  each domain's `Risk`, and getting the user's approval. It runs no searches of its own and
+  writes to no spreadsheet.
+
+The analysis workbook is the boundary between them. Its `AnonymizedDomain` column *is* the
+redaction plan, so the user can edit the sheet between analysis and redaction and have the edit
+take effect.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Annotated, Literal
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import BaseModel, Field
 
-from . import local
 from . import redact as redaction
+from . import research as osint
 from .scan import open_workbook, scan_path, unique_domains
 from .staging import ANALYSIS_WORKBOOK_ENV, Staging, analysis_workbook_path
 from .workbook import RISKS, AnalysisWorkbook, DomainReference, today
@@ -30,11 +32,13 @@ mcp = MCPServer(
     'email-domain-scrubber',
     instructions=(
         'Tools for the email domain privacy workflow on local Excel (.xlsx) usage metric '
-        'reports. Typical order: scan_workbook -> list_domains_for_analysis -> (analyze, '
-        'then get user approval) -> store_domain_analysis -> plan_redaction -> apply every '
-        'returned write block with the Excel MCP server write_data_to_excel tool -> '
-        'finish_redaction. The analysis workbook is a local .xlsx holding the durable record; '
-        f'pass its path to every tool or set the {ANALYSIS_WORKBOOK_ENV} environment variable.'
+        'reports. Order: scan_workbook -> list_domains_for_analysis -> research_domains -> '
+        '(judge, then get user approval) -> store_domain_analysis -> let the user review and '
+        'edit the analysis workbook -> plan_redaction -> apply_redaction. This server performs '
+        'all research and all writes; the caller judges risk and talks to the user. The analysis '
+        'workbook is a local .xlsx holding the durable record, and its AnonymizedDomain column '
+        'is the redaction plan; pass its path to every tool or set the '
+        f'{ANALYSIS_WORKBOOK_ENV} environment variable.'
     ),
 )
 
@@ -118,26 +122,9 @@ class RedactionCell(BaseModel):
     after: str
 
 
-class WriteBlockOut(BaseModel):
-    """One `write_data_to_excel` call for the Excel MCP server."""
-
-    sheet_name: str = Field(description='Pass as `sheet_name`.')
-    start_cell: str = Field(description='Pass as `start_cell`.')
-    data: list[list[str]] = Field(description='Pass as `data`. Rows of a single column.')
-
-
 class PlanResult(BaseModel):
     source_workbook_path: str
-    redacted_path: str = Field(
-        description='The copy to edit. Pass as `filepath` to write_data_to_excel. Empty if '
-        'there is nothing to change.'
-    )
     cells_to_change: int
-    write_blocks: list[WriteBlockOut] = Field(
-        description='Apply every one of these with the Excel MCP server write_data_to_excel '
-        'tool, then call finish_redaction. Applying only some leaves domains exposed, which '
-        'finish_redaction will reject.'
-    )
     domains_anonymized: dict[str, str] = Field(
         default_factory=dict, description='Domain -> alias, for domains that will be replaced.'
     )
@@ -148,9 +135,85 @@ class PlanResult(BaseModel):
     sample_changes: list[RedactionCell] = Field(
         default_factory=list, description='A few before/after examples to show the user.'
     )
+    aliases_minted: dict[str, str] = Field(
+        default_factory=dict,
+        description='Aliases created just now for rows hand-edited to High risk without one. '
+        'Empty in the normal case; non-empty means the analysis workbook was edited after '
+        'store_domain_analysis ran, and those edits are now in effect.',
+    )
 
 
-class FinishResult(BaseModel):
+class RegistrationOut(BaseModel):
+    """What RDAP published. Usually less than you would hope — see `registrant_name`."""
+
+    status: Literal['found', 'not_found', 'unavailable']
+    registrant_name: str = Field(
+        default='',
+        description='Almost always empty for .com/.org/.net: since GDPR those registries redact '
+        'the registrant entirely. An empty value is the norm and means nothing either way. A '
+        'value here, which some ccTLDs still publish, is strong evidence.',
+    )
+    registrant_organization: str = ''
+    registrant_kind: str = Field(
+        default='', description="The registry's vCard kind, e.g. 'individual' or 'org'."
+    )
+    privacy_shielded: bool = Field(
+        default=False,
+        description='The registrant field holds a privacy service rather than a name. Weak '
+        'evidence of an individual, not proof — organizations shield too. Say so if you rely '
+        'on it.',
+    )
+    registered_on: str = Field(
+        default='', description='Registration date. Context, not evidence of who.'
+    )
+    registrar: str = Field(
+        default='',
+        description='Usually published even when the registrant is not. A consumer registrar is '
+        'weak evidence of an individual; a corporate brand-protection one, of a company.',
+    )
+    detail: str = Field(default='', description='Why a lookup came back empty, when it did.')
+
+
+class LiteratureHitOut(BaseModel):
+    title: str = ''
+    authors: str = ''
+    first_author: str = ''
+    year: str = ''
+    journal: str = ''
+    doi: str = ''
+    is_preprint: bool = False
+
+
+class LiteratureOut(BaseModel):
+    status: Literal['found', 'not_found', 'unavailable']
+    hit_count: int = 0
+    hits: list[LiteratureHitOut] = Field(default_factory=list)
+    distinct_first_authors: list[str] = Field(
+        default_factory=list,
+        description='First authors across the hits. One name over several papers points at a '
+        'single-principal domain; many names point at an institution.',
+    )
+    detail: str = ''
+
+
+class DomainEvidenceOut(BaseModel):
+    """The evidence for one domain. Judgement is the caller's; this is only what was found."""
+
+    domain: str
+    registration: RegistrationOut
+    literature: LiteratureOut
+    resolved: bool = Field(
+        description='Whether any source said anything substantive. False means unidentifiable on '
+        'the evidence available — classify conservatively and tell the user it is unresolved.'
+    )
+    not_searched: list[str] = Field(
+        default_factory=list,
+        description='Sources this server did not consult. Do not search them yourself; say what '
+        'is missing instead.',
+    )
+
+
+class ApplyResult(BaseModel):
     source_workbook_path: str
     redacted_workbook_path: str = Field(description='The redacted .xlsx on disk.')
     redacted_workbook_title: str
@@ -237,6 +300,76 @@ def list_domains_for_analysis(
     ]
 
 
+@mcp.tool()
+def research_domains(
+    domains: Annotated[
+        list[str],
+        Field(
+            description='Domains to research, as listed by list_domains_for_analysis. Batch them '
+            'in one call.',
+            min_length=1,
+            max_length=60,
+        ),
+    ],
+) -> list[DomainEvidenceOut]:
+    """Gather the registration and publication evidence for domains, from this server.
+
+    Two sources, both free and unauthenticated: RDAP (the structured successor to WHOIS) for who
+    registered the domain and whether the registrant is an organization, a person, or a privacy
+    shield; and Europe PMC for the scientific literature, PubMed and bioRxiv/medRxiv preprints
+    together, searched full text.
+
+    This is the only research the workflow does. Do not run web searches or fetch pages yourself:
+    a verdict has to rest on evidence that is the same from one run to the next, and `not_searched`
+    names the sources nobody consulted so an explanation can say so honestly. Reasoning from what
+    you already know about a well-known institution is fine and needs no lookup.
+
+    Each source degrades on its own — a timeout or a registry that does not answer RDAP comes back
+    as a status and a reason, not an error. A domain with `resolved: false` is unidentifiable on
+    this evidence: classify it conservatively and flag it to the user rather than inventing a
+    rationale.
+    """
+    return [_evidence(item) for item in osint.research_domains(domains)]
+
+
+def _evidence(found: osint.DomainEvidence) -> DomainEvidenceOut:
+    registration = found.registration
+    literature = found.literature
+    return DomainEvidenceOut(
+        domain=found.domain,
+        registration=RegistrationOut(
+            status=registration.status,
+            registrant_name=registration.registrant_name,
+            registrant_organization=registration.registrant_organization,
+            registrant_kind=registration.registrant_kind,
+            privacy_shielded=registration.privacy_shielded,
+            registered_on=registration.registered_on,
+            registrar=registration.registrar,
+            detail=registration.detail,
+        ),
+        literature=LiteratureOut(
+            status=literature.status,
+            hit_count=literature.hit_count,
+            hits=[
+                LiteratureHitOut(
+                    title=hit.title,
+                    authors=hit.authors,
+                    first_author=hit.first_author,
+                    year=hit.year,
+                    journal=hit.journal,
+                    doi=hit.doi,
+                    is_preprint=hit.is_preprint,
+                )
+                for hit in literature.hits
+            ],
+            distinct_first_authors=literature.distinct_first_authors,
+            detail=literature.detail,
+        ),
+        resolved=found.resolved,
+        not_searched=found.not_searched,
+    )
+
+
 class AnalysisInput(BaseModel):
     """One domain's verdict from the risk analysis skill."""
 
@@ -273,6 +406,10 @@ def store_domain_analysis(
     Call this only after presenting the analysis to the user and getting their approval. Writing
     is idempotent per domain: re-storing updates Risk and Explanation, and a domain that already
     has an alias keeps it, so aliases stay stable across quarterly reports.
+
+    Afterwards, point the user at `analysis_workbook_path` and let them review it before
+    redaction. They may edit it: `AnonymizedDomain` is the plan, so clearing a token spares a
+    domain, and a Risk edited up to High gets a token minted by plan_redaction.
     """
     analysis = _open_analysis(analysis_workbook)
     stored = analysis.store_analysis(
@@ -297,34 +434,30 @@ def store_domain_analysis(
 def plan_redaction(
     workbook: WorkbookPath, analysis_workbook: AnalysisWorkbookPath = None
 ) -> PlanResult:
-    """Copy the workbook and return the cell writes that anonymize it.
+    """Preview what redaction will change, reading the report and the analysis workbook.
 
-    The source workbook is not modified. This makes `<name> (anonymized).xlsx` in the work
-    directory and tells you what to write into it; the Excel MCP server does the writing.
+    Writes nothing to the report and creates no copy. The substitutions come entirely from the
+    analysis workbook's `AnonymizedDomain` column — that column is the plan. Domains with no alias
+    are left in place on purpose, and a domain in the report with no recorded analysis at all is
+    refused, so nothing unreviewed can reach a shared report.
 
-    Only domains whose analysis assigned an alias are replaced; domains analyzed as not needing
-    anonymization are left in place on purpose. Fails if any domain in the workbook has no
-    recorded analysis, so nothing unreviewed can reach a shared report.
+    The one thing this does write is to the analysis workbook itself, and only to make it
+    self-consistent: a row the user hand-edited to High risk without an alias gets one, reported
+    back as `aliases_minted`. Clearing an alias is left alone — that is how the user says "leave
+    this domain in".
 
-    Show the user `cells_to_change` and `sample_changes` and get approval. Then pass each entry
-    of `write_blocks` to the Excel MCP server's write_data_to_excel with `filepath` set to
-    `redacted_path`, and finally call finish_redaction.
+    Show the user `cells_to_change` and `sample_changes`, get approval, then call apply_redaction.
     """
-    staging = _staging()
     analysis = _open_analysis(analysis_workbook)
     staged = open_workbook(workbook)
     hits = scan_path(staged.path, staged.url)
+
+    minted = analysis.reconcile_aliases(unique_domains(hits))
     plan = redaction.plan_redaction(staged, hits, analysis)
-    copy = redaction.create_copy(staged, staging) if plan.edits else None
 
     return PlanResult(
         source_workbook_path=plan.source_path,
-        redacted_path=str(copy) if copy else '',
         cells_to_change=plan.cells_to_change,
-        write_blocks=[
-            WriteBlockOut(sheet_name=block.sheet, start_cell=block.start_cell, data=block.values)
-            for block in plan.blocks
-        ],
         domains_anonymized=plan.mapped_domains,
         domains_left_as_is=plan.left_as_is,
         sample_changes=[
@@ -333,54 +466,44 @@ def plan_redaction(
             )
             for edit in plan.edits[:10]
         ],
+        aliases_minted=minted,
     )
 
 
 @mcp.tool()
-def finish_redaction(
-    workbook: WorkbookPath,
-    redacted_path: Annotated[
-        str, Field(description='The `redacted_path` that plan_redaction returned.')
-    ],
-    analysis_workbook: AnalysisWorkbookPath = None,
-) -> FinishResult:
-    """Verify the redacted copy and record what was changed.
+def apply_redaction(
+    workbook: WorkbookPath, analysis_workbook: AnalysisWorkbookPath = None
+) -> ApplyResult:
+    """Write the anonymized copy of the report, verify it, and record what changed.
 
-    Call this after applying every write block from plan_redaction with the Excel MCP server.
-    It re-scans the redacted file first and refuses to finish if any domain that should have been
-    replaced is still there — a produced plan does not prove the writes landed, since another
-    server performs them.
+    Call this after plan_redaction and after the user has approved. Everything happens here: the
+    report is byte-copied to `<name> (anonymized).xlsx` in the work directory, the planned cells
+    are written into the copy, the copy is read back, and every rewritten cell is appended to the
+    Redactions sheet with its before and after.
 
-    The redacted file stays on disk and nothing leaves the machine. On success every rewritten
-    cell is appended to the Redactions sheet of the analysis workbook. Check `remaining_domains`:
-    it should hold exactly the domains analyzed as not needing anonymization.
+    The plan is recomputed from the report and the analysis workbook rather than taken as an
+    argument, so what gets written is whatever the workbook says at this moment — including any
+    edit the user made while reviewing it. If the report has changed since plan_redaction, the
+    result will differ from the preview; the counts returned describe what was actually done.
+
+    Verification is a re-read of the file just written. If any domain that should have been
+    replaced is still present, this raises and records nothing, leaving the copy on disk to
+    inspect. The source report is never modified and nothing leaves the machine — sharing the copy
+    is the user's to do. Check `remaining_domains`: it should hold exactly the domains analyzed as
+    not needing anonymization.
     """
     analysis = _open_analysis(analysis_workbook)
     staged = open_workbook(workbook)
     hits = scan_path(staged.path, staged.url)
-    # Recomputed from the source, so the record reflects the same plan the writes came from.
-    plan = redaction.plan_redaction(staged, hits, analysis)
 
-    path = Path(redacted_path).expanduser()
-    if not path.is_file():
-        raise FileNotFoundError(
-            f'{path} does not exist. Pass the redacted_path that plan_redaction returned, after '
-            'the Excel MCP server has written to it.'
-        )
+    analysis.reconcile_aliases(unique_domains(hits))
+    plan, copy, records = redaction.redact(staged, hits, analysis, _staging())
+    remaining = unique_domains(scan_path(copy, source_url=''))
 
-    missed = redaction.verify(path, plan.mapped_domains)
-    if missed:
-        from .errors import RedactionNotApplied
-
-        raise RedactionNotApplied(str(path), missed)
-
-    records = redaction.record(plan, path, analysis)
-    remaining = unique_domains(scan_path(path, local.url(path)))
-
-    return FinishResult(
+    return ApplyResult(
         source_workbook_path=plan.source_path,
-        redacted_workbook_path=str(path),
-        redacted_workbook_title=path.name,
+        redacted_workbook_path=str(copy),
+        redacted_workbook_title=copy.name,
         cells_changed=plan.cells_to_change,
         domains_anonymized=plan.mapped_domains,
         domains_left_as_is=plan.left_as_is,

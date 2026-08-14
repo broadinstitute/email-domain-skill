@@ -5,7 +5,7 @@ import random
 import pytest
 
 from email_domain_scrubber import xlsx
-from email_domain_scrubber.errors import SchemaMismatch
+from email_domain_scrubber.errors import InvalidRisk, SchemaMismatch
 from email_domain_scrubber.workbook import (
     DOMAIN_ANALYSIS,
     DOMAIN_REFERENCES,
@@ -190,14 +190,124 @@ def test_normalize_risk_canonicalizes_case():
 def test_record_redactions_appends_rows(analysis):
     analysis.record_redactions(
         [
-            RedactionRecord('src', 'dst', 'ref-1', 'lab.io', 'anon0001', '2026-02-01'),
-            RedactionRecord('src', 'dst', 'ref-2', 'lab.io', 'anon0001', '2026-02-01'),
+            RedactionRecord(
+                'src', 'dst', 'ref-1', 'lab.io', 'anon0001', 'a@lab.io', 'a@anon0001', '2026-02-01'
+            ),
+            RedactionRecord(
+                'src', 'dst', 'ref-2', 'lab.io', 'anon0001', 'b@lab.io', 'b@anon0001', '2026-02-01'
+            ),
         ]
     )
 
     rows = xlsx.read_rows(analysis.path, REDACTIONS)[1:]
     assert len(rows) == 2
-    assert rows[0] == ['2026-02-01', 'src', 'dst', 'ref-1', 'lab.io', 'anon0001']
+    assert rows[0] == [
+        '2026-02-01',
+        'src',
+        'dst',
+        'ref-1',
+        'lab.io',
+        'anon0001',
+        'a@lab.io',
+        'a@anon0001',
+    ]
+
+
+# -- reconciling a hand-edited sheet ------------------------------------------------------------
+def test_reconcile_mints_an_alias_for_a_row_edited_up_to_high(analysis):
+    """The user's edit has to take effect, or it silently changes nothing."""
+    analysis.store_analysis([('lab.io', 'Low', 'looked like an org', None)], random.Random(1))
+    _set_risk(analysis, 'lab.io', 'High')
+
+    minted = analysis.reconcile_aliases(['lab.io'], random.Random(1))
+
+    assert list(minted) == ['lab.io']
+    assert analysis.anonymized_mapping() == {'lab.io': minted['lab.io']}
+
+
+def test_reconcile_leaves_a_cleared_alias_alone_below_high(analysis):
+    """Clearing the cell is how the user spares a domain — as long as Risk is not High."""
+    analysis.store_analysis([('lab.io', 'Medium', 'small lab', True)], random.Random(1))
+    _set_alias(analysis, 'lab.io', '')
+
+    assert analysis.reconcile_aliases(['lab.io'], random.Random(1)) == {}
+    assert analysis.anonymized_mapping() == {}
+
+
+def test_reconcile_restores_an_alias_cleared_on_a_row_still_reading_high(analysis):
+    """High with nothing to replace it reads as a half-finished edit; lowering Risk is the way."""
+    analysis.store_analysis([('lab.io', 'High', 'a person', None)], random.Random(1))
+    _set_alias(analysis, 'lab.io', '')
+
+    assert list(analysis.reconcile_aliases(['lab.io'], random.Random(1))) == ['lab.io']
+
+
+def test_clearing_the_alias_and_lowering_the_risk_together_spare_the_domain(analysis):
+    analysis.store_analysis([('lab.io', 'High', 'a person', None)], random.Random(1))
+    _edit(analysis, 'lab.io', risk='Low', alias='')
+
+    assert analysis.reconcile_aliases(['lab.io'], random.Random(1)) == {}
+    assert analysis.anonymized_mapping() == {}
+
+
+def test_reconcile_canonicalizes_a_hand_typed_risk(analysis):
+    analysis.store_analysis([('lab.io', 'Low', 'an org', None)], random.Random(1))
+    _set_risk(analysis, 'lab.io', 'medium')
+
+    analysis.reconcile_aliases(['lab.io'], random.Random(1))
+
+    assert analysis.analysis_by_domain()['lab.io'].risk == 'Medium'
+
+
+def test_reconcile_rejects_a_risk_outside_the_taxonomy(analysis):
+    analysis.store_analysis([('lab.io', 'Low', 'an org', None)], random.Random(1))
+    _set_risk(analysis, 'lab.io', 'Critical')
+
+    with pytest.raises(InvalidRisk, match='lab.io'):
+        analysis.reconcile_aliases(['lab.io'], random.Random(1))
+
+
+def test_reconcile_ignores_domains_outside_the_scope(analysis):
+    """Only the report being redacted is reconciled, so unrelated rows are not touched."""
+    analysis.store_analysis([('lab.io', 'Low', 'an org', None)], random.Random(1))
+    _set_risk(analysis, 'lab.io', 'High')
+
+    assert analysis.reconcile_aliases(['other.org'], random.Random(1)) == {}
+    assert analysis.anonymized_mapping() == {}
+
+
+def test_reconcile_keeps_existing_aliases_unique(analysis):
+    analysis.store_analysis([('one.io', 'High', 'a person', None)], random.Random(1))
+    existing = analysis.anonymized_mapping()['one.io']
+    analysis.store_analysis([('two.io', 'Low', 'an org', None)], random.Random(1))
+    _set_risk(analysis, 'two.io', 'High')
+
+    # The same seed would hand out the same token if the taken set were ignored.
+    minted = analysis.reconcile_aliases(['two.io'], random.Random(1))
+
+    assert minted['two.io'] != existing
+
+
+def _edit(analysis, domain, *, risk=None, alias=None):
+    """Hand-edit one row, the way the user would in Excel."""
+    rows = [
+        [
+            row.domain,
+            risk if risk is not None and row.domain == domain else row.risk,
+            row.explanation,
+            alias if alias is not None and row.domain == domain else row.anonymized_domain,
+        ]
+        for row in analysis.analysis_rows()
+    ]
+    xlsx.rewrite(analysis.path, {DOMAIN_ANALYSIS: [HEADERS[DOMAIN_ANALYSIS], *rows]})
+
+
+def _set_risk(analysis, domain, risk):
+    _edit(analysis, domain, risk=risk)
+
+
+def _set_alias(analysis, domain, alias):
+    _edit(analysis, domain, alias=alias)
 
 
 def test_writes_to_one_sheet_do_not_disturb_another(analysis):

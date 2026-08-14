@@ -1,14 +1,12 @@
 """Producing an anonymized copy of a metrics workbook.
 
-The source workbook on disk is never modified. Redaction copies it, and the **Excel MCP server**
-writes the replacement values into that copy — this module only plans the writes and, afterwards,
-verifies that they landed.
+The source workbook on disk is never modified. Redaction byte-copies it, writes the replacement
+values into the copy, reads the copy back to check the writes landed, and records what changed.
 
-Planning emits *blocks* rather than individual cells because `write_data_to_excel` takes a
-rectangle of rows at an offset. Edits are grouped into runs of consecutive rows within a single
-column, which is exactly the shape a column of email addresses produces: one block per column
-per run, rather than one tool call per cell. Runs never extend across a gap, so no cell outside
-the edit set is ever written.
+All of that happens here, in one process. The substitutions are not decided here: they are read
+from the analysis workbook's ``AnonymizedDomain`` column, which is the whole of the plan. A
+domain with a token is replaced, a domain without one is left alone, and nothing else — not the
+risk level, not the skill, not an argument to these functions — gets a say.
 """
 
 from __future__ import annotations
@@ -17,11 +15,9 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from openpyxl.utils import get_column_letter
-
-from . import local
+from . import local, xlsx
 from .domains import apply_redactions
-from .errors import UnanalyzedDomains
+from .errors import RedactionNotApplied, UnanalyzedDomains
 from .scan import ScanHit, StagedWorkbook, scan_path
 from .staging import Staging
 from .workbook import AnalysisWorkbook, RedactionRecord
@@ -38,19 +34,6 @@ class CellEdit:
     domains: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class WriteBlock:
-    """One `write_data_to_excel` call: a column run of replacement values."""
-
-    sheet: str
-    start_cell: str
-    values: list[list[str]]
-
-    @property
-    def cell_count(self) -> int:
-        return len(self.values)
-
-
 @dataclass
 class RedactionPlan:
     """What redaction will do. Computing it touches no files."""
@@ -58,7 +41,6 @@ class RedactionPlan:
     source_path: str
     source_title: str
     edits: list[CellEdit]
-    blocks: list[WriteBlock]
     mapped_domains: dict[str, str]
     left_as_is: list[str]
 
@@ -72,8 +54,8 @@ def plan_redaction(
 ) -> RedactionPlan:
     """Decide which cells to rewrite, refusing while any domain is unanalyzed.
 
-    Pure: no file is read or written here, so the plan can be recomputed cheaply — which
-    `finish_redaction` does, to check the writes against the same plan that produced them.
+    Pure: no file is read or written here, so the plan can be recomputed cheaply — which the
+    apply step does, rather than trusting a plan handed back to it.
 
     Domains analyzed as not needing anonymization have no token and are deliberately left
     untouched — that is the approved outcome, not an omission.
@@ -91,19 +73,17 @@ def plan_redaction(
     mapping = {domain: assigned[domain] for domain in found if domain in assigned}
     left_as_is = [domain for domain in found if domain not in mapping]
 
-    edits = _plan_edits(hits, mapping)
     return RedactionPlan(
         source_path=str(staged.path),
         source_title=staged.title,
-        edits=edits,
-        blocks=coalesce(edits),
+        edits=_plan_edits(hits, mapping),
         mapped_domains=mapping,
         left_as_is=left_as_is,
     )
 
 
 def create_copy(staged: StagedWorkbook, staging: Staging) -> Path:
-    """Copy the staged workbook to `<name> (anonymized).xlsx` for the Excel MCP server to edit.
+    """Copy the staged workbook to `<name> (anonymized).xlsx`, ready to be written into.
 
     A byte copy, so everything the source workbook contains survives up to the point where
     openpyxl rewrites it.
@@ -111,6 +91,22 @@ def create_copy(staged: StagedWorkbook, staging: Staging) -> Path:
     destination = staging.anonymized_path(str(staged.path), staged.path.name)
     shutil.copy2(staged.path, destination)
     return destination
+
+
+def apply(plan: RedactionPlan, copy: Path) -> int:
+    """Write every planned edit into `copy`, and return how many cells were written.
+
+    Only the planned cells are touched. A cell that was scanned but not edited is left exactly as
+    the byte copy found it, so nothing outside the approved set is rewritten — which matters
+    because cells are read with cached values, and writing one back would replace a formula with
+    its result.
+    """
+    by_sheet: dict[str, list[tuple[int, int, str]]] = {}
+    for edit in plan.edits:
+        by_sheet.setdefault(edit.sheet_title, []).append((edit.row, edit.column, edit.after))
+    if not by_sheet:
+        return 0
+    return xlsx.write_cells(copy, by_sheet)
 
 
 def _plan_edits(hits: list[ScanHit], mapping: dict[str, str]) -> list[CellEdit]:
@@ -137,62 +133,41 @@ def _plan_edits(hits: list[ScanHit], mapping: dict[str, str]) -> list[CellEdit]:
     return sorted(edits, key=lambda edit: (edit.sheet_title, edit.column, edit.row))
 
 
-def coalesce(edits: list[CellEdit]) -> list[WriteBlock]:
-    """Group edits into runs of consecutive rows within one column of one sheet.
-
-    A run stops at the first row gap, so a block never covers a cell that is not being edited.
-
-    Gaps are deliberately *not* bridged, even where the intervening cell's value is known from
-    the scan. Bridging would cut the number of write calls when redacted cells alternate with
-    kept ones, but it would also rewrite cells nobody approved changing — and since cells are
-    read with cached values, writing one back would replace a formula with its result. The cost
-    of not bridging is bounded by how many cells are being redacted, which for this workload is
-    a small minority of any email column.
-    """
-    blocks: list[WriteBlock] = []
-    run: list[CellEdit] = []
-
-    def flush() -> None:
-        if not run:
-            return
-        first = run[0]
-        blocks.append(
-            WriteBlock(
-                sheet=first.sheet_title,
-                start_cell=f'{get_column_letter(first.column)}{first.row}',
-                values=[[edit.after] for edit in run],
-            )
-        )
-        run.clear()
-
-    for edit in sorted(edits, key=lambda e: (e.sheet_title, e.column, e.row)):
-        contiguous = (
-            run
-            and edit.sheet_title == run[-1].sheet_title
-            and edit.column == run[-1].column
-            and edit.row == run[-1].row + 1
-        )
-        if not contiguous:
-            flush()
-        run.append(edit)
-    flush()
-    return blocks
-
-
 def verify(path: Path, mapping: dict[str, str]) -> list[str]:
-    """Domains from `mapping` that are still present in the written file.
-
-    An external server does the writing now, so a produced plan no longer implies applied
-    edits. This is what catches a write step that was skipped or only half ran.
-    """
+    """Domains from `mapping` that are still present in the written file."""
     present = {hit.domain for hit in scan_path(path, source_url='')}
     return [domain for domain in mapping if domain in present]
+
+
+def redact(
+    staged: StagedWorkbook, hits: list[ScanHit], analysis: AnalysisWorkbook, staging: Staging
+) -> tuple[RedactionPlan, Path, list[RedactionRecord]]:
+    """Plan, copy, write, verify, and record — the whole redaction, in that order.
+
+    Verification is a re-read of the file just written, not a check of the plan against itself:
+    producing the right values proves nothing about whether they reached the disk. If any mapped
+    domain survives, this raises and records nothing, leaving the copy for inspection rather than
+    an audit trail asserting a redaction that did not happen.
+    """
+    plan = plan_redaction(staged, hits, analysis)
+    copy = create_copy(staged, staging)
+    apply(plan, copy)
+
+    missed = verify(copy, plan.mapped_domains)
+    if missed:
+        raise RedactionNotApplied(str(copy), missed)
+
+    return plan, copy, record(plan, copy, analysis)
 
 
 def record(
     plan: RedactionPlan, redacted_path: Path, analysis: AnalysisWorkbook
 ) -> list[RedactionRecord]:
-    """Append one Redactions row per (cell, domain) actually rewritten."""
+    """Append one Redactions row per (cell, domain) rewritten, with the cell's before and after.
+
+    A cell holding two anonymized domains produces two rows sharing the same before and after:
+    keeping `Domain` a single value is what lets the log be joined against `DomainAnalysis`.
+    """
     redacted_url = local.url(redacted_path)
     records = [
         RedactionRecord(
@@ -201,6 +176,8 @@ def record(
             reference=local.cell_reference(redacted_url, edit.sheet_title, edit.a1),
             domain=domain,
             anonymized_domain=plan.mapped_domains[domain],
+            before=edit.before,
+            after=edit.after,
         )
         for edit in plan.edits
         for domain in edit.domains
@@ -212,10 +189,10 @@ def record(
 __all__ = [
     'CellEdit',
     'RedactionPlan',
-    'WriteBlock',
-    'coalesce',
+    'apply',
     'create_copy',
     'plan_redaction',
     'record',
+    'redact',
     'verify',
 ]

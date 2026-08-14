@@ -104,11 +104,37 @@ def read_rows(path: Path, sheet_title: str) -> list[list[str]]:
         workbook.close()
 
 
+def write_cells(path: Path, values: dict[str, list[tuple[int, int, str]]]) -> int:
+    """Set individual cells, given `{sheet_title: [(row, column, text), ...]}`.
+
+    Cell by cell rather than by rectangle: only the cells named here are touched, so a redaction
+    can never write over a neighbouring cell that nobody approved changing. Returns how many were
+    written.
+    """
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path)
+    try:
+        written = 0
+        for title, cells in values.items():
+            if title not in workbook.sheetnames:
+                raise KeyError(f'{path} has no sheet named {title!r}.')
+            worksheet = workbook[title]
+            for row, column, text in cells:
+                worksheet.cell(row=row, column=column, value=text)
+                written += 1
+        workbook.save(path)
+        return written
+    finally:
+        workbook.close()
+
+
 def rewrite(path: Path, sheets: dict[str, list[list[str]]]) -> None:
     """Replace the contents of the named sheets, leaving other sheets alone.
 
-    Used only for the analysis workbook, which this server owns outright. Metrics workbooks are
-    never written here — the Excel MCP server does that, from the blocks `redact.py` plans.
+    Used only for the analysis workbook, which this server owns outright. A metrics workbook is
+    never rewritten wholesale — redaction goes through `write_cells`, which touches only the cells
+    it was asked to.
     """
     from openpyxl import load_workbook
 

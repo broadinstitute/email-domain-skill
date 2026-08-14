@@ -1,16 +1,19 @@
 """Test helpers.
 
 Workbooks are real `.xlsx` files built with openpyxl, so the tests exercise the same reader and
-writer that production uses. The only thing faked is the *other* MCP server: `Recorder` stands in
-for the Excel server that performs the redaction writes.
+writer that production uses. Nothing about the spreadsheet layer is faked.
+
+The one thing faked is the network: `fake_fetch` stands in for `research.http_get`, so the
+research tests are as offline as the rest of the suite.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
 from pathlib import Path
 
 from email_domain_scrubber import xlsx
+from email_domain_scrubber.research import FetchError
 
 
 def write_xlsx(path: Path, sheets: dict[str, list[list[str]]]) -> Path:
@@ -19,33 +22,20 @@ def write_xlsx(path: Path, sheets: dict[str, list[list[str]]]) -> Path:
     return path
 
 
-@dataclass
-class Recorder:
-    """Captures what the Excel MCP server would have been asked to do.
+def fake_fetch(responses: dict[str, str | Exception]) -> Callable[[str], bytes]:
+    """A `research.Fetch` that answers by URL substring.
 
-    Redaction writes are performed by an external server in production. Tests apply the same
-    blocks with openpyxl, which is what that server does internally, and keep the calls so a
-    test can assert on their shape.
+    Keyed on a substring rather than the whole URL so a test can say 'the RDAP call' or 'the
+    Europe PMC call' without restating query strings. An unmatched URL raises, which is what an
+    unreachable source looks like to the code under test.
     """
 
-    calls: list[tuple[str, str, str, list[list[str]]]] = field(default_factory=list)
+    def fetch(url: str) -> bytes:
+        for marker, response in responses.items():
+            if marker in url:
+                if isinstance(response, Exception):
+                    raise response
+                return response.encode()
+        raise FetchError(f'no canned response for {url}')
 
-    def apply(self, path: Path, blocks: list) -> None:
-        """Stand in for `write_data_to_excel`, one call per block."""
-        from openpyxl import load_workbook
-        from openpyxl.utils.cell import coordinate_to_tuple
-
-        for block in blocks:
-            self.calls.append((str(path), block.sheet, block.start_cell, block.values))
-            row, column = coordinate_to_tuple(block.start_cell)
-            workbook = load_workbook(path)
-            try:
-                worksheet = workbook[block.sheet]
-                for row_offset, values in enumerate(block.values):
-                    for column_offset, value in enumerate(values):
-                        worksheet.cell(
-                            row=row + row_offset, column=column + column_offset, value=value
-                        )
-                workbook.save(path)
-            finally:
-                workbook.close()
+    return fetch

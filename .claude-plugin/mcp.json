@@ -2,12 +2,13 @@
   "mcpServers": {
     "email-domain-scrubber": {
       "command": "uv",
-      "args": ["run", "--project", "${CLAUDE_PLUGIN_ROOT}", "--frozen", "email-domain-scrubber"],
-      "env": {}
-    },
-    "excel": {
-      "command": "uvx",
-      "args": ["excel-mcp-server", "stdio"],
+      "args": [
+        "run",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "--frozen",
+        "email-domain-scrubber"
+      ],
       "env": {}
     }
   }
