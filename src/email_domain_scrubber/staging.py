@@ -1,8 +1,7 @@
 """The local working directory.
 
 Everything this server produces lands here rather than beside the user's report, so nothing
-unexpected appears next to the file they pointed at. It is also what lets the Excel MCP server
-touch the redacted copy at all — in stdio mode it requires an absolute local path.
+unexpected appears next to the file they pointed at.
 
 Layout under the work directory:
 

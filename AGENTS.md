@@ -11,32 +11,55 @@ resolves that reference and refuses anything that is a URL rather than a path.
 
 ## Architecture
 
-Three parts, each with one job:
+Two parts, each with one job:
 
-- **The analysis skill** judges risk and gets user approval.
-- **The `email-domain-scrubber` MCP server** (this repo) does everything deterministic and
-  auditable: reading workbooks, finding domains, recording them, minting aliases, planning the
-  rewrite, and verifying it happened.
-- **The Excel MCP server** ([`excel-mcp-server`](https://github.com/haris-musa/excel-mcp-server))
-  applies the planned cell writes to a copy of the workbook.
+- **The analysis skill** judges risk and talks to the user. It runs no research of its own and
+  writes to no spreadsheet.
+- **The `email-domain-scrubber` MCP server** (this repo) does everything factual and everything
+  that writes: reading workbooks, finding domains, researching them, recording verdicts, minting
+  aliases, rewriting the redacted copy, verifying it, and logging what changed.
+
+The split is the point. Research lives in the server so that the evidence behind a verdict is
+fixed by code rather than by whatever query a model thought of, and two runs over the same domain
+see the same sources. Writing lives in the server so that there is no path by which a judgement
+becomes a cell edit without passing through the analysis workbook.
 
 Workbook bytes never pass through the model's context: the server reads the file itself, and only
 domains, locators, and counts travel back through a tool result.
 
 Skill to perform risk analysis of each email domain:
 
-- use the MCP server to extract a list of domains to analysis
+- use the MCP server to extract a list of domains to analyze
+- use the MCP server to research each domain; craft no queries of its own
 - analyze email domain for the privacy risk of associating the domain to a specific person
 - explain analysis and justify recommendations to anonymize
 - obtain user approval for the analysis and recommendations
-- use the MCP server to store approved analysis and plan approved redactions
+- use the MCP server to store approved analysis
+- have the user review, and optionally edit, the analysis workbook
+- use the MCP server to plan and then apply the redaction
 
-MCP server to anonymize domains and create a structured analysis and anonymization report:
+MCP server to research and anonymize domains and create a structured analysis and anonymization
+report:
 
 - scan reports for email domain names (the analysis skill uses this to list domains to analyze)
+- research a domain's registration (RDAP) and appearances in the scientific literature (Europe PMC)
 - store analysis results in a separate domain analysis workbook (the analysis skill calls this to report its results)
-- plan the cell writes that anonymize email domain names in the metrics reports
-- verify those writes landed and keep separate records of anonymizations
+- write the anonymized copy of the report, driven solely by the analysis workbook
+- verify the writes landed and keep separate records of anonymizations
+
+### Research sources
+
+Both free, unauthenticated, and named in every result so an explanation can be honest about them:
+
+- **RDAP** via `rdap.org`. Post-GDPR, gTLD registries redact the registrant, so a name is usually
+  absent for `.com`/`.org`/`.net` and its absence means nothing; some ccTLDs still publish one.
+  `rdap.org` also times out and does not cover every ccTLD, so `unavailable` is a normal outcome.
+- **Europe PMC**, full-text over PubMed and bioRxiv/medRxiv. The deciding source in most hard
+  cases: one recurring first author points at a person, many point at an institution.
+
+Deliberately not wired, and reported as `not_searched`: general web search (needs a paid API key),
+fetching the domain's own site (contacting a user's host to profile them), GitHub, and ORCID.
+Adding a source means adding it here, not letting the skill improvise one.
 
 ## Domain Analysis Workbook Schema
 
@@ -77,6 +100,20 @@ There should be only one row for each unique `Domain`.
 The MCP generates `AnonymizedDomain` for each new `Domain` and retains any pre-existing mapping.
 The analysis skill determines the `Risk` and the need to anonymize; the MCP handles persistence of this workbook.
 
+**This sheet is the redaction plan.** There is no separate plan: `AnonymizedDomain` is exactly the
+set of substitutions `apply_redaction` will make, and nothing else decides them. That is what makes
+the user's review step real — they edit this sheet, and the edit takes effect. Two rules, reconciled
+at plan time:
+
+- A domain with an `AnonymizedDomain` is replaced, whatever its `Risk`.
+- A domain whose `Risk` reads `High` is given an `AnonymizedDomain` if it has none.
+
+So sparing a domain marked High takes both edits: clear the alias *and* lower the risk. Clearing
+the alias alone is undone, deliberately — a row reading `High` with nothing to replace it with is
+more likely a half-finished edit than a decision, and this is the direction that fails safe. A
+`Risk` outside the taxonomy is refused, naming the row. An alias is never reissued or changed, so
+mappings stay valid across quarters.
+
 Example:
 
 ```csv
@@ -96,10 +133,17 @@ Columns:
 - `Reference`, a locator for the rewritten cell *in the copy*
 - `Domain`, the domain that was replaced
 - `AnonymizedDomain`, what replaced it
+- `Before`, the cell's full text before the rewrite
+- `After`, the cell's full text after it
 
-One row per cell actually rewritten. This is what satisfies "keep separate records of
-anonymizations": `DomainAnalysis` holds the mapping and `DomainReferences` holds the source
-locations, but neither records what was produced, where, and when.
+The applied log, written by `apply_redaction` only after it has read the copy back and confirmed
+the writes landed. One row per rewritten cell per domain replaced — a cell holding two anonymized
+domains yields two rows sharing the same `Before` and `After`, which keeps `Domain` a single value
+that joins against `DomainAnalysis`.
+
+This is what satisfies "keep separate records of anonymizations": `DomainAnalysis` holds the
+mapping and `DomainReferences` holds the source locations, but neither records what was produced,
+where, and when.
 
 ## Skill: Privacy Risk Analysis of Email Domains
 
@@ -126,25 +170,28 @@ You are an expert Privacy Compliance & OSINT Analyst for scientific computing pl
 
 Do **not** consider unrelated risks such as domain reputation, email provider used, or the security and trustworthiness of users of the domain.
 
+**Email usernames are out of scope.** Only the domain is judged. `alice@smithlab.io` and
+`j.smith@smithlab.io` are one domain with one verdict, and that `j.smith` echoes `smithlab` is not
+evidence of anything. Usernames must not appear in an `Explanation`. Redaction replaces the domain
+and leaves the local part in place, by design.
+
 ### Risk Analysis
 
-When evaluating ambiguous or custom domains, simulate or execute the following search steps:
+Call `research_domains` for the domains in the queue, in one batch. Run no searches of your own —
+no web search, no fetch, no asking the user to look something up. What the server returns is the
+evidence; see *Research sources* above for what each one is worth and what its absence means.
 
-1. General Web Search:
-   - Query: "domain.com" OR site:domain.com
-   - Look for: Personal portfolios, single-person blogs, or individual contact footers.
+Your own knowledge of a domain is legitimate evidence and should be used, especially where RDAP is
+redacted. Say when a verdict rests on recall rather than a lookup, and never attribute a claim to a
+source that did not make it.
 
-2. Scholarly & Scientific Databases:
-   - Google Scholar / PubMed: Search "domain.com" in author affiliation lines or correspondence emails.
-   - ORCID Search: Query ORCID registries for emails ending in "@domain.com".
-   - bioRxiv / medRxiv: Check preprints for corresponding author emails matching the domain.
-
-3. Code & Infrastructure Registries:
-   - GitHub / GitLab: Search site:github.com "domain.com" to identify single-user repositories or personal sites.
-
-4. WHOIS / RDAP & Web Archives:
-   - Check if the domain registrant name matches a personal name or privacy-shielded individual rather than an organization.
+Where the evidence is exhausted and the domain is still unidentified, classify conservatively
+(Medium rather than Low) and flag it to the user as unresolved. Do not infer a verdict from the
+shape of the name.
 
 ### Output
 
-Call the MCP server to store the Risk and Explanation for each domain.
+Present the analysis, get the user's approval, then call the MCP server to store the Risk and
+Explanation for each domain. Then hand the user the analysis workbook to review and edit before
+calling `plan_redaction` and `apply_redaction`. The skill writes nothing to any spreadsheet at any
+point.

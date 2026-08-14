@@ -5,13 +5,19 @@ Sheets, per AGENTS.md:
 * ``Workbooks``        — every metrics workbook that has been scanned
 * ``DomainReferences`` — one row per cell a domain was found in (many rows per domain)
 * ``DomainAnalysis``   — exactly one row per unique domain, holding the skill's verdict
-* ``Redactions``       — one row per cell actually rewritten, satisfying the requirement to keep
-  separate records of anonymizations (the mapping and the source locations live in the two
-  sheets above; this records what was produced, where, and when)
+* ``Redactions``       — one row per cell rewritten, with what it held before and after,
+  satisfying the requirement to keep separate records of anonymizations (the mapping and the
+  source locations live in the two sheets above; this records what was produced, where, and when)
 
 The skill owns ``Risk`` and ``Explanation``. This module owns ``AnonymizedDomain``: it mints a
 token when analysis says a domain needs one and never changes a token that already exists, so
 tokens stay stable across quarters.
+
+``DomainAnalysis`` is also the redaction plan — ``AnonymizedDomain`` is exactly the set of
+substitutions redaction will make, and nothing else decides them. That is what lets the user edit
+the sheet between analysis and redaction: clear a token and the domain survives, and
+:meth:`AnalysisWorkbook.reconcile_aliases` mints one for a row hand-edited up to High so an edit
+that should cause a redaction actually does.
 
 It is a plain local `.xlsx`, so the whole sheet is loaded, mutated, and saved on every write —
 no row-number tracking, no cache to invalidate. Being a plain file, it can also live in a git
@@ -26,7 +32,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import anonymize, xlsx
-from .errors import SchemaMismatch
+from .errors import InvalidRisk, SchemaMismatch
 
 WORKBOOKS = 'Workbooks'
 DOMAIN_REFERENCES = 'DomainReferences'
@@ -44,6 +50,8 @@ HEADERS: dict[str, list[str]] = {
         'Reference',
         'Domain',
         'AnonymizedDomain',
+        'Before',
+        'After',
     ],
 }
 
@@ -95,6 +103,8 @@ class RedactionRecord:
     reference: str
     domain: str
     anonymized_domain: str
+    before: str = ''
+    after: str = ''
     date_redacted: str = field(default_factory=today)
 
 
@@ -292,6 +302,55 @@ class AnalysisWorkbook:
     def _analysis_values(row: AnalysisRow) -> list[str]:
         return [row.domain, row.risk, row.explanation, row.anonymized_domain]
 
+    def reconcile_aliases(
+        self, domains: list[str] | None = None, rng: random.Random | None = None
+    ) -> dict[str, str]:
+        """Make the sheet's own contents consistent, and return the aliases that had to be minted.
+
+        Called at redaction time, when the sheet may have been hand-edited since the skill wrote
+        it. Two repairs, both confined to `domains` when given:
+
+        * A row whose Risk reads High but has no alias gets one. Without this, editing a Risk up
+          to High would look like it took effect and silently change nothing, since redaction
+          reads the alias column and nothing else.
+        * A Risk typed in another casing is written back canonicalized.
+
+        So the two columns together say: **an alias means the domain is replaced, and High means
+        it gets an alias.** Sparing a domain the skill marked High therefore takes both edits —
+        clear the alias *and* lower the Risk. Clearing the alias alone is undone here, on the
+        grounds that a row reading `High` with nothing to replace it with is more likely a
+        half-finished edit than a decision.
+
+        An alias is never removed and never changed: aliases are stable across quarters, and
+        re-minting one would break a mapping already published in an earlier report.
+        """
+        rows = self.analysis_rows()
+        scope = {domain.lower() for domain in domains} if domains is not None else None
+        taken = {row.anonymized_domain for row in rows if row.anonymized_domain}
+
+        minted: dict[str, str] = {}
+        changed = False
+        for row in rows:
+            if not row.analyzed or (scope is not None and row.domain not in scope):
+                continue
+            try:
+                risk = normalize_risk(row.risk)
+            except ValueError as error:
+                raise InvalidRisk(row.domain, row.risk) from error
+            if risk != row.risk:
+                row.risk = risk
+                changed = True
+            if risk == 'High' and not row.anonymized_domain:
+                token = anonymize.generate_token(taken, rng)
+                taken.add(token)
+                row.anonymized_domain = token
+                minted[row.domain] = token
+                changed = True
+
+        if changed:
+            self._write(DOMAIN_ANALYSIS, [self._analysis_values(row) for row in rows])
+        return minted
+
     def record_redactions(self, records: list[RedactionRecord]) -> None:
         self._append(
             REDACTIONS,
@@ -303,6 +362,8 @@ class AnalysisWorkbook:
                     record.reference,
                     record.domain,
                     record.anonymized_domain,
+                    record.before,
+                    record.after,
                 ]
                 for record in records
             ],
